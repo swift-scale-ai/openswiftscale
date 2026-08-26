@@ -1,0 +1,44 @@
+name: Feature request
+description: Propose a focused Community feature or improvement.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: checkboxes
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and discussions for a similar proposal.
+          required: true
+        - label: This proposal fits a lightweight, self-hosted AI gateway.
+          required: true
+  - type: textarea
+    attributes:
+      label: Problem
+      description: Describe the user problem without assuming a particular implementation.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Proposed experience
+      description: Explain the desired workflow, API behavior, or UI behavior.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Alternatives and trade-offs
+      description: Note workarounds, compatibility constraints, or operational costs.
+  - type: dropdown
+    attributes:
+      label: Area
+      options:
+        - Provider connections
+        - Model routing
+        - Gateway API
+        - API users and keys
+        - Usage and cost
+        - Web console and localization
+        - Installation and operations
+        - Documentation
+        - Other
+    validations:
+      required: true

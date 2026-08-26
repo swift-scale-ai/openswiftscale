@@ -1,0 +1,44 @@
+name: openswiftscale
+
+services:
+  gateway:
+    image: ghcr.io/swift-scale-ai/openswiftscale:${OPENSWIFTSCALE_VERSION:-latest}
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${OPENSWIFTSCALE_BIND_ADDRESS:-127.0.0.1}:8080:8080"
+    environment:
+      OPENSWIFTSCALE_LISTEN_ADDR: ":8080"
+      OPENSWIFTSCALE_PUBLIC_URL: "${OPENSWIFTSCALE_PUBLIC_URL:-http://127.0.0.1:8080}"
+      OPENSWIFTSCALE_DATABASE_PATH: /data/openswiftscale.db
+      OPENSWIFTSCALE_CATALOG_PATH: /etc/openswiftscale/catalog.yaml
+      OPENSWIFTSCALE_API_KEYS_FILE: /run/secrets/gateway_api_keys
+      OPENSWIFTSCALE_ADMIN_USERNAME: "${OPENSWIFTSCALE_ADMIN_USERNAME:-admin}"
+      OPENSWIFTSCALE_ADMIN_PASSWORD_FILE: /run/secrets/admin_password
+      OPENSWIFTSCALE_MASTER_KEY_PATH: /data/keys/master.key
+      OPENSWIFTSCALE_LOG_PROMPTS: "false"
+    volumes:
+      - openswiftscale_data:/data
+      - ../config/catalog.yaml:/etc/openswiftscale/catalog.yaml:ro
+    secrets:
+      - gateway_api_keys
+      - admin_password
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/app/openswiftscale", "healthcheck"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  openswiftscale_data:
+
+secrets:
+  gateway_api_keys: {file: ../secrets/gateway_api_keys.txt}
+  admin_password: {file: ../secrets/admin_password.txt}

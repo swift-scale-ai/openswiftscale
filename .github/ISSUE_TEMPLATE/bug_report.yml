@@ -1,0 +1,61 @@
+name: Bug report
+description: Report a reproducible OpenSwiftScale Community defect.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve OpenSwiftScale. Never include API keys, passwords, prompts, customer data, database files, or unredacted logs.
+  - type: checkboxes
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+        - label: I removed credentials and sensitive data from this report.
+          required: true
+        - label: This is not a security vulnerability (security reports follow SECURITY.md).
+          required: true
+  - type: input
+    attributes:
+      label: OpenSwiftScale version
+      placeholder: v0.1.0, container digest, or commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Installation method
+      options:
+        - scripts/install.sh and scripts/start.sh
+        - Docker Compose
+        - Release binary
+        - Source development environment
+        - Other
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Operating system and architecture
+      placeholder: macOS 15 arm64, Ubuntu 24.04 amd64
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and the expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start OpenSwiftScale with ...
+        2. Configure ...
+        3. Send ...
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Sanitized logs or screenshots
+      description: Redact hostnames, IPs, API keys, Authorization headers, prompts, and personal data.
