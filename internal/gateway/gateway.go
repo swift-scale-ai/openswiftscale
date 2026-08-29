@@ -62,6 +62,9 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/embeddings", g.withAPIAuth(g.inference("embeddings")))
 	mux.HandleFunc("GET /api/admin/status", g.withManagementAuth(g.adminStatus))
 	mux.HandleFunc("GET /api/admin/models", g.withManagementAuth(g.adminModels))
+	mux.HandleFunc("GET /api/admin/model-families", g.withManagementAuth(g.adminModelFamilies))
+	mux.HandleFunc("GET /api/admin/model-routes/{id}", g.withManagementAuth(g.adminModelRouteSettings))
+	mux.HandleFunc("PATCH /api/admin/model-routes/{id}", g.withManagementAuth(g.saveModelRouteSettings))
 	mux.HandleFunc("GET /api/admin/model-route-policies", g.withManagementAuth(g.adminModelRoutePolicies))
 	mux.HandleFunc("POST /api/admin/model-route-policies", g.withManagementAuth(g.saveModelRoutePolicy))
 	mux.HandleFunc("DELETE /api/admin/model-route-policies/{id}", g.withManagementAuth(g.deleteModelRoutePolicy))
@@ -382,6 +385,51 @@ func (g *Gateway) adminModels(w http.ResponseWriter, _ *http.Request) {
 		out = append(out, item{Model: model, Available: g.router.Available(model)})
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func (g *Gateway) adminModelFamilies(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, g.router.Catalog().SortedFamilies())
+}
+
+func (g *Gateway) adminModelRouteSettings(w http.ResponseWriter, r *http.Request) {
+	settings, found, err := g.store.ModelRouteSettings(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database_error", err.Error())
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "unknown_model", "The requested model route does not exist.")
+		return
+	}
+	writeJSON(w, http.StatusOK, settings)
+}
+
+type modelRouteSettingsInput struct {
+	UsePlatformDefault bool                       `json:"use_platform_default"`
+	Endpoints          []store.ModelRouteEndpoint `json:"endpoints"`
+}
+
+func (g *Gateway) saveModelRouteSettings(w http.ResponseWriter, r *http.Request) {
+	var input modelRouteSettingsInput
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256<<10)).Decode(&input); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Valid model route settings are required.")
+		return
+	}
+	settings := store.ModelRouteSettings{ModelID: r.PathValue("id"), UsePlatformDefault: input.UsePlatformDefault, Endpoints: input.Endpoints}
+	if err := g.store.SaveModelRouteSettings(r.Context(), settings); err != nil {
+		writeError(w, http.StatusBadRequest, "save_failed", err.Error())
+		return
+	}
+	if err := g.refreshRuntime(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, "runtime_refresh_failed", err.Error())
+		return
+	}
+	updated, _, err := g.store.ModelRouteSettings(r.Context(), settings.ModelID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
 }
 
 func (g *Gateway) adminModelRoutePolicies(w http.ResponseWriter, r *http.Request) {

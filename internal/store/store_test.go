@@ -64,7 +64,7 @@ func TestProviderConfigurationIsEncryptedAndReloaded(t *testing.T) {
 	}
 	defer s.Close()
 	ctx := context.Background()
-	c := &catalog.Catalog{Providers: []catalog.Provider{{ID: "official", Type: "openai-compatible", BaseURL: "https://provider.example"}}, Models: []catalog.Model{{ID: "model", Name: "Model", Family: "test", Provider: "official", UpstreamModel: "upstream", Capabilities: []string{"chat"}}}}
+	c := &catalog.Catalog{Providers: []catalog.Provider{{ID: "official", Type: "openai-compatible", BaseURL: "https://provider.example"}}, Families: []catalog.ModelFamily{{ID: "image", Name: "Image", Publisher: "Example", Provider: "official", Capabilities: []string{"image"}}}, Models: []catalog.Model{{ID: "model", Name: "Model", Family: "test", Provider: "official", UpstreamModel: "upstream", Capabilities: []string{"chat"}}}}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestProviderConfigurationIsEncryptedAndReloaded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(runtimeCatalog.Models) != 1 || keys["official"] != key {
+	if len(runtimeCatalog.Models) != 1 || len(runtimeCatalog.Families) != 1 || runtimeCatalog.Families[0].ID != "image" || keys["official"] != key {
 		t.Fatalf("unexpected runtime configuration: %#v %#v", runtimeCatalog, keys)
 	}
 	providers, err := s.Providers(ctx)
@@ -159,6 +159,60 @@ func TestMultipleRoutesSharePublicModelAndSurviveConnectionDeletion(t *testing.T
 	routes = runtimeCatalog.ModelsByID("shared-model")
 	if len(routes) != 1 || routes[0].Provider != "route-two" {
 		t.Fatalf("remaining route was lost: %#v", routes)
+	}
+}
+
+func TestSimpleModelRouteSettingsRoundTrip(t *testing.T) {
+	directory := t.TempDir()
+	protector, err := secret.LoadOrCreate(filepath.Join(directory, "master.key"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := OpenWithProtector(filepath.Join(directory, "gateway.db"), protector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	for _, providerID := range []string{"route-one", "route-two"} {
+		key := providerID + "-secret"
+		p := catalog.Provider{ID: providerID, Type: "openai-compatible", BaseURL: "https://" + providerID + ".example"}
+		m := catalog.Model{ID: "shared-model", Name: "Shared model", Family: "test", Provider: providerID, UpstreamModel: providerID, Capabilities: []string{"chat"}, Pricing: catalog.Pricing{Currency: "USD"}}
+		if err := s.SaveConnection(ctx, ConnectionUpdate{Provider: p, Name: providerID, Enabled: true, APIKey: &key, Models: []catalog.Model{m}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	settings, found, err := s.ModelRouteSettings(ctx, "shared-model")
+	if err != nil || !found || !settings.UsePlatformDefault || len(settings.Endpoints) != 2 {
+		t.Fatalf("unexpected initial settings: %#v found=%v err=%v", settings, found, err)
+	}
+	settings.UsePlatformDefault = false
+	settings.Endpoints[0], settings.Endpoints[1] = settings.Endpoints[1], settings.Endpoints[0]
+	settings.Endpoints[0].Weight = 70
+	settings.Endpoints[1].Weight = 30
+	settings.Endpoints[1].Enabled = false
+	if err := s.SaveModelRouteSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	updated, found, err := s.ModelRouteSettings(ctx, "shared-model")
+	if err != nil || !found || updated.UsePlatformDefault || updated.Endpoints[0].ProviderID != "route-two" || updated.Endpoints[0].Priority != 10 || updated.Endpoints[0].Weight != 70 || updated.Endpoints[1].Enabled {
+		t.Fatalf("manual settings were not persisted: %#v found=%v err=%v", updated, found, err)
+	}
+	runtimeCatalog, _, err := s.RuntimeCatalog(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes := runtimeCatalog.ModelsByID("shared-model")
+	if len(routes) != 1 || !routes[0].ManualRouting || routes[0].RouteOrder != 10 || routes[0].Weight != 70 {
+		t.Fatalf("manual routing metadata was not loaded: %#v", routes)
+	}
+	updated.UsePlatformDefault = true
+	if err := s.SaveModelRouteSettings(ctx, updated); err != nil {
+		t.Fatal(err)
+	}
+	defaults, _, err := s.ModelRouteSettings(ctx, "shared-model")
+	if err != nil || !defaults.UsePlatformDefault || defaults.Endpoints[0].Priority != 100 || defaults.Endpoints[0].Weight != 100 {
+		t.Fatalf("platform defaults were not restored: %#v err=%v", defaults, err)
 	}
 }
 

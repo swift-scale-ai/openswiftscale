@@ -38,6 +38,21 @@ func TestCapabilityMismatch(t *testing.T) {
 	}
 }
 
+func TestCatalogClonePreservesPublishedFamilies(t *testing.T) {
+	c := &catalog.Catalog{
+		Providers: []catalog.Provider{{ID: "p", BaseURL: "https://p"}},
+		Families:  []catalog.ModelFamily{{ID: "video", Name: "Video", Publisher: "Publisher", Provider: "p", Capabilities: []string{"video"}}},
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	r := New(c, nil)
+	got := r.Catalog()
+	if len(got.Families) != 1 || got.Families[0].ID != "video" {
+		t.Fatalf("published model families were dropped: %#v", got.Families)
+	}
+}
+
 func TestResolveOrdersRoutesByPriority(t *testing.T) {
 	c := &catalog.Catalog{
 		Providers: []catalog.Provider{{ID: "primary", BaseURL: "https://primary"}, {ID: "secondary", BaseURL: "https://secondary"}},
@@ -80,6 +95,31 @@ func TestResolveDistributesEqualPriorityByWeight(t *testing.T) {
 	}
 	if selected["a"] != 3 || selected["b"] != 1 {
 		t.Fatalf("unexpected weighted distribution: %#v", selected)
+	}
+}
+
+func TestManualRoutingUsesWeightAcrossDraggedOrder(t *testing.T) {
+	c := &catalog.Catalog{
+		Providers: []catalog.Provider{{ID: "a", BaseURL: "https://a"}, {ID: "b", BaseURL: "https://b"}},
+		Models: []catalog.Model{
+			{ID: "shared", Provider: "a", UpstreamModel: "a", Capabilities: []string{"chat"}, Priority: 10, RouteOrder: 10, Weight: 3, ManualRouting: true},
+			{ID: "shared", Provider: "b", UpstreamModel: "b", Capabilities: []string{"chat"}, Priority: 20, RouteOrder: 20, Weight: 1, ManualRouting: true},
+		},
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	r := New(c, map[string]string{"a": "key", "b": "key"})
+	selected := map[string]int{}
+	for range 4 {
+		routes, err := r.Resolve("shared", "chat")
+		if err != nil {
+			t.Fatal(err)
+		}
+		selected[routes[0].Provider.ID]++
+	}
+	if selected["a"] != 3 || selected["b"] != 1 {
+		t.Fatalf("manual route weights were not applied across the dragged order: %#v", selected)
 	}
 }
 

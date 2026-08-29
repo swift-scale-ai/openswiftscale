@@ -10,8 +10,20 @@ import (
 )
 
 type Catalog struct {
-	Providers []Provider `yaml:"providers" json:"providers"`
-	Models    []Model    `yaml:"models" json:"models"`
+	Providers []Provider    `yaml:"providers" json:"providers"`
+	Families  []ModelFamily `yaml:"families,omitempty" json:"families,omitempty"`
+	Models    []Model       `yaml:"models" json:"models"`
+}
+
+type ModelFamily struct {
+	ID               string   `yaml:"id" json:"id"`
+	Name             string   `yaml:"name" json:"name"`
+	Publisher        string   `yaml:"publisher" json:"publisher"`
+	Provider         string   `yaml:"provider" json:"provider"`
+	Capabilities     []string `yaml:"capabilities,omitempty" json:"capabilities,omitempty"`
+	Routeable        bool     `yaml:"routeable" json:"routeable"`
+	OfficialAccess   string   `yaml:"official_access,omitempty" json:"official_access,omitempty"`
+	OfficialEndpoint string   `yaml:"official_endpoint,omitempty" json:"official_endpoint,omitempty"`
 }
 
 type Provider struct {
@@ -40,6 +52,8 @@ type Model struct {
 	Metadata        map[string]string `yaml:"metadata,omitempty" json:"metadata,omitempty"`
 	Priority        int               `yaml:"priority,omitempty" json:"priority"`
 	Weight          int               `yaml:"weight,omitempty" json:"weight"`
+	RouteOrder      int               `yaml:"-" json:"route_order,omitempty"`
+	ManualRouting   bool              `yaml:"-" json:"-"`
 }
 
 type Pricing struct {
@@ -100,6 +114,36 @@ func (c *Catalog) Validate() error {
 		}
 		providers[p.ID] = true
 	}
+	families := map[string]bool{}
+	for i := range c.Families {
+		family := &c.Families[i]
+		family.ID = strings.ToLower(strings.TrimSpace(family.ID))
+		family.Name = strings.TrimSpace(family.Name)
+		family.Publisher = strings.TrimSpace(family.Publisher)
+		family.Provider = strings.ToLower(strings.TrimSpace(family.Provider))
+		family.OfficialAccess = strings.ToLower(strings.TrimSpace(family.OfficialAccess))
+		family.OfficialEndpoint = strings.TrimRight(strings.TrimSpace(family.OfficialEndpoint), "/")
+		if family.ID == "" || family.Name == "" || family.Publisher == "" {
+			return fmt.Errorf("catalog family id, name and publisher are required")
+		}
+		if family.Routeable && family.Provider == "" {
+			return fmt.Errorf("routeable model family %q requires a provider", family.ID)
+		}
+		if family.Provider != "" && !providers[family.Provider] {
+			return fmt.Errorf("model family %q references unknown provider %q", family.ID, family.Provider)
+		}
+		if family.Provider == "" && family.OfficialEndpoint != "" && family.OfficialAccess == "" {
+			return fmt.Errorf("model family %q with an official endpoint requires official_access", family.ID)
+		}
+		if family.OfficialAccess != "" && family.OfficialAccess != "deployment" && family.OfficialAccess != "self-hosted" {
+			return fmt.Errorf("model family %q has unsupported official_access %q", family.ID, family.OfficialAccess)
+		}
+		key := strings.ToLower(family.Publisher) + "\x00" + family.ID
+		if families[key] {
+			return fmt.Errorf("duplicate model family %q for publisher %q", family.ID, family.Publisher)
+		}
+		families[key] = true
+	}
 	seen := map[string]bool{}
 	for i := range c.Models {
 		m := &c.Models[i]
@@ -133,6 +177,17 @@ func (c *Catalog) Validate() error {
 		}
 	}
 	return nil
+}
+
+func (c *Catalog) SortedFamilies() []ModelFamily {
+	out := append([]ModelFamily(nil), c.Families...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Publisher != out[j].Publisher {
+			return out[i].Publisher < out[j].Publisher
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
 }
 
 func (c *Catalog) ProviderByID(id string) (Provider, bool) {

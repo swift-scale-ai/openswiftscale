@@ -38,6 +38,7 @@ type Summary struct {
 type Store struct {
 	db        *sql.DB
 	protector *secret.Protector
+	families  []catalog.ModelFamily
 }
 
 type ProviderConnection struct {
@@ -77,6 +78,24 @@ type ModelRoutePolicy struct {
 	Strategy  string    `json:"strategy"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type ModelRouteEndpoint struct {
+	ProviderID  string  `json:"provider_id"`
+	Name        string  `json:"name"`
+	BaseURL     string  `json:"base_url"`
+	Official    bool    `json:"official"`
+	Enabled     bool    `json:"enabled"`
+	Priority    int     `json:"priority"`
+	Weight      int     `json:"weight"`
+	InputPrice  float64 `json:"input_price"`
+	OutputPrice float64 `json:"output_price"`
+}
+
+type ModelRouteSettings struct {
+	ModelID            string               `json:"model_id"`
+	UsePlatformDefault bool                 `json:"use_platform_default"`
+	Endpoints          []ModelRouteEndpoint `json:"endpoints"`
 }
 
 func Open(path string) (*Store, error) {
@@ -199,6 +218,12 @@ CREATE TABLE IF NOT EXISTS model_route_policies (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS model_route_preferences (
+  model_id TEXT PRIMARY KEY REFERENCES model_configs(id) ON DELETE CASCADE,
+  use_platform_default INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS routing_rules (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -273,11 +298,14 @@ VALUES(?,?,?,?,?,?,?,?,?,1,1,?,?)`, p.ID, providerDisplayName(p.ID), p.Type, p.B
 	seededRoutes := make(map[string]bool, len(c.Models))
 	for _, m := range c.Models {
 		seededRoutes[m.ID+"\x00"+m.Provider] = true
-		if err := insertModel(ctx, tx, m, true, now); err != nil {
+		if err := insertModel(ctx, tx, m, true, true, now); err != nil {
 			return err
 		}
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT r.model_id,r.provider_id FROM model_routes r JOIN provider_connections p ON p.id=r.provider_id WHERE p.official=1`)
+	rows, err := tx.QueryContext(ctx, `SELECT r.model_id,r.provider_id FROM model_routes r
+JOIN provider_connections p ON p.id=r.provider_id
+JOIN model_configs m ON m.id=r.model_id
+WHERE p.official=1 AND m.metadata_json NOT LIKE '%"demo":true%'`)
 	if err != nil {
 		return err
 	}
@@ -304,10 +332,17 @@ VALUES(?,?,?,?,?,?,?,?,?,1,1,?,?)`, p.ID, providerDisplayName(p.ID), p.Type, p.B
 	if _, err := tx.ExecContext(ctx, `DELETE FROM model_configs WHERE NOT EXISTS (SELECT 1 FROM model_routes r WHERE r.model_id=model_configs.id)`); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.families = append([]catalog.ModelFamily(nil), c.Families...)
+	for index := range s.families {
+		s.families[index].Capabilities = append([]string(nil), s.families[index].Capabilities...)
+	}
+	return nil
 }
 
-func insertModel(ctx context.Context, tx *sql.Tx, m catalog.Model, updateCanonical bool, now string) error {
+func insertModel(ctx context.Context, tx *sql.Tx, m catalog.Model, updateCanonical, preserveRoutePolicy bool, now string) error {
 	capabilities, _ := json.Marshal(m.Capabilities)
 	fallbacks, _ := json.Marshal(m.Fallbacks)
 	metadata, _ := json.Marshal(m.Metadata)
@@ -326,27 +361,42 @@ currency=excluded.currency,fallbacks_json=excluded.fallbacks_json,metadata_json=
 		m.MaxOutputTokens, m.Pricing.InputPerMillion, m.Pricing.OutputPerMillion, m.Pricing.Currency, string(fallbacks), string(metadata), now, now); err != nil {
 		return err
 	}
-	_, err := tx.ExecContext(ctx, `INSERT INTO model_routes
+	routeCommand := `INSERT INTO model_routes
 (model_id,provider_id,upstream_model,capabilities_json,context_window,max_output_tokens,input_per_million,output_per_million,currency,priority,weight,enabled,created_at,updated_at)
 VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?) ON CONFLICT(model_id,provider_id) DO UPDATE SET
 upstream_model=excluded.upstream_model,capabilities_json=excluded.capabilities_json,context_window=excluded.context_window,
 max_output_tokens=excluded.max_output_tokens,input_per_million=excluded.input_per_million,output_per_million=excluded.output_per_million,
-currency=excluded.currency,priority=excluded.priority,weight=excluded.weight,enabled=1,updated_at=excluded.updated_at`,
+currency=excluded.currency,priority=excluded.priority,weight=excluded.weight,enabled=1,updated_at=excluded.updated_at`
+	if preserveRoutePolicy {
+		routeCommand = `INSERT INTO model_routes
+(model_id,provider_id,upstream_model,capabilities_json,context_window,max_output_tokens,input_per_million,output_per_million,currency,priority,weight,enabled,created_at,updated_at)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,1,?,?) ON CONFLICT(model_id,provider_id) DO UPDATE SET
+upstream_model=excluded.upstream_model,capabilities_json=excluded.capabilities_json,context_window=excluded.context_window,
+max_output_tokens=excluded.max_output_tokens,input_per_million=excluded.input_per_million,output_per_million=excluded.output_per_million,
+currency=excluded.currency,updated_at=excluded.updated_at`
+	}
+	_, err := tx.ExecContext(ctx, routeCommand,
 		m.ID, m.Provider, m.UpstreamModel, string(capabilities), m.ContextWindow, m.MaxOutputTokens,
 		m.Pricing.InputPerMillion, m.Pricing.OutputPerMillion, m.Pricing.Currency, m.Priority, m.Weight, now, now)
 	return err
 }
 
 func (s *Store) RuntimeCatalog(ctx context.Context) (*catalog.Catalog, map[string]string, error) {
-	connections, err := s.providerRows(ctx, true)
+	// Keep disabled providers in the runtime catalog as discovery metadata so
+	// their published model families remain visible. Disabled connections do
+	// not contribute model routes or decrypted routing keys below.
+	connections, err := s.providerRows(ctx, false)
 	if err != nil {
 		return nil, nil, err
 	}
-	c := &catalog.Catalog{}
+	c := &catalog.Catalog{Families: append([]catalog.ModelFamily(nil), s.families...)}
+	for index := range c.Families {
+		c.Families[index].Capabilities = append([]string(nil), c.Families[index].Capabilities...)
+	}
 	keys := make(map[string]string, len(connections))
 	for _, row := range connections {
 		c.Providers = append(c.Providers, row.connection.Provider)
-		if len(row.ciphertext) > 0 {
+		if row.connection.Enabled && len(row.ciphertext) > 0 {
 			if s.protector == nil {
 				return nil, nil, fmt.Errorf("provider %q is encrypted but no master key is available", row.connection.ID)
 			}
@@ -358,8 +408,9 @@ func (s *Store) RuntimeCatalog(ctx context.Context) (*catalog.Catalog, map[strin
 		}
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT m.id,m.name,m.family,r.provider_id,r.upstream_model,r.capabilities_json,r.context_window,
-r.max_output_tokens,r.input_per_million,r.output_per_million,r.currency,m.fallbacks_json,m.metadata_json,r.priority,r.weight
+r.max_output_tokens,r.input_per_million,r.output_per_million,r.currency,m.fallbacks_json,m.metadata_json,r.priority,r.weight,COALESCE(pref.use_platform_default,1)
 FROM model_routes r JOIN model_configs m ON m.id=r.model_id JOIN provider_connections p ON p.id=r.provider_id
+LEFT JOIN model_route_preferences pref ON pref.model_id=r.model_id
 WHERE m.enabled=1 AND r.enabled=1 AND p.enabled=1 ORDER BY m.id,r.priority,r.provider_id`)
 	if err != nil {
 		return nil, nil, err
@@ -368,11 +419,14 @@ WHERE m.enabled=1 AND r.enabled=1 AND p.enabled=1 ORDER BY m.id,r.priority,r.pro
 	for rows.Next() {
 		var m catalog.Model
 		var capabilities, fallbacks, metadata string
+		var usePlatformDefault int
 		if err := rows.Scan(&m.ID, &m.Name, &m.Family, &m.Provider, &m.UpstreamModel, &capabilities, &m.ContextWindow,
 			&m.MaxOutputTokens, &m.Pricing.InputPerMillion, &m.Pricing.OutputPerMillion, &m.Pricing.Currency, &fallbacks, &metadata,
-			&m.Priority, &m.Weight); err != nil {
+			&m.Priority, &m.Weight, &usePlatformDefault); err != nil {
 			return nil, nil, err
 		}
+		m.RouteOrder = m.Priority
+		m.ManualRouting = usePlatformDefault == 0
 		_ = json.Unmarshal([]byte(capabilities), &m.Capabilities)
 		_ = json.Unmarshal([]byte(fallbacks), &m.Fallbacks)
 		_ = json.Unmarshal([]byte(metadata), &m.Metadata)
@@ -456,6 +510,91 @@ func (s *Store) Provider(ctx context.Context, id string) (ProviderConnection, bo
 	return ProviderConnection{}, false, nil
 }
 
+func (s *Store) ModelRouteSettings(ctx context.Context, modelID string) (ModelRouteSettings, bool, error) {
+	modelID = strings.ToLower(strings.TrimSpace(modelID))
+	settings := ModelRouteSettings{ModelID: modelID, UsePlatformDefault: true}
+	rows, err := s.db.QueryContext(ctx, `SELECT r.provider_id,p.name,p.base_url,p.official,r.enabled,r.priority,r.weight,r.input_per_million,r.output_per_million
+FROM model_routes r JOIN provider_connections p ON p.id=r.provider_id
+WHERE r.model_id=? ORDER BY r.priority,r.provider_id`, modelID)
+	if err != nil {
+		return settings, false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var endpoint ModelRouteEndpoint
+		var official, enabled int
+		if err := rows.Scan(&endpoint.ProviderID, &endpoint.Name, &endpoint.BaseURL, &official, &enabled, &endpoint.Priority, &endpoint.Weight, &endpoint.InputPrice, &endpoint.OutputPrice); err != nil {
+			return settings, false, err
+		}
+		endpoint.Official, endpoint.Enabled = official != 0, enabled != 0
+		settings.Endpoints = append(settings.Endpoints, endpoint)
+	}
+	if err := rows.Err(); err != nil {
+		return settings, false, err
+	}
+	if len(settings.Endpoints) == 0 {
+		return settings, false, nil
+	}
+	var usePlatformDefault int
+	err = s.db.QueryRowContext(ctx, `SELECT use_platform_default FROM model_route_preferences WHERE model_id=?`, modelID).Scan(&usePlatformDefault)
+	if err != nil && err != sql.ErrNoRows {
+		return settings, false, err
+	}
+	settings.UsePlatformDefault = err == sql.ErrNoRows || usePlatformDefault != 0
+	return settings, true, nil
+}
+
+func (s *Store) SaveModelRouteSettings(ctx context.Context, settings ModelRouteSettings) error {
+	settings.ModelID = strings.ToLower(strings.TrimSpace(settings.ModelID))
+	if settings.ModelID == "" || len(settings.Endpoints) == 0 {
+		return fmt.Errorf("model route settings require at least one endpoint")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var expected int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM model_routes WHERE model_id=?`, settings.ModelID).Scan(&expected); err != nil {
+		return err
+	}
+	if expected == 0 || expected != len(settings.Endpoints) {
+		return fmt.Errorf("route endpoint list is incomplete")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	seen := make(map[string]struct{}, len(settings.Endpoints))
+	for index, endpoint := range settings.Endpoints {
+		endpoint.ProviderID = strings.ToLower(strings.TrimSpace(endpoint.ProviderID))
+		if endpoint.ProviderID == "" {
+			return fmt.Errorf("provider ID is required")
+		}
+		if _, exists := seen[endpoint.ProviderID]; exists {
+			return fmt.Errorf("provider %q appears more than once", endpoint.ProviderID)
+		}
+		seen[endpoint.ProviderID] = struct{}{}
+		priority, weight := (index+1)*10, endpoint.Weight
+		if settings.UsePlatformDefault {
+			priority, weight = 100, 100
+		}
+		if weight < 1 || weight > 10000 {
+			return fmt.Errorf("route weight must be between 1 and 10000")
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE model_routes SET enabled=?,priority=?,weight=?,updated_at=? WHERE model_id=? AND provider_id=?`,
+			boolInt(endpoint.Enabled), priority, weight, now, settings.ModelID, endpoint.ProviderID)
+		if err != nil {
+			return err
+		}
+		if count, _ := result.RowsAffected(); count != 1 {
+			return fmt.Errorf("provider %q is not an endpoint for model %q", endpoint.ProviderID, settings.ModelID)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO model_route_preferences(model_id,use_platform_default,created_at,updated_at) VALUES(?,?,?,?)
+ON CONFLICT(model_id) DO UPDATE SET use_platform_default=excluded.use_platform_default,updated_at=excluded.updated_at`, settings.ModelID, boolInt(settings.UsePlatformDefault), now, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) SaveConnection(ctx context.Context, update ConnectionUpdate) error {
 	p := update.Provider
 	if s.protector == nil && update.APIKey != nil && strings.TrimSpace(*update.APIKey) != "" {
@@ -500,7 +639,7 @@ validation_status='unverified',last_validated_at=NULL,last_error='',updated_at=?
 	}
 	for _, m := range update.Models {
 		m.Provider = p.ID
-		if err := insertModel(ctx, tx, m, false, now); err != nil {
+		if err := insertModel(ctx, tx, m, false, false, now); err != nil {
 			return err
 		}
 	}
@@ -669,7 +808,7 @@ func boolInt(value bool) int {
 }
 
 func providerDisplayName(id string) string {
-	names := map[string]string{"deepseek": "DeepSeek", "xiaomi": "Xiaomi MiMo", "tencent": "Tencent Hy", "openai": "OpenAI", "nvidia": "NVIDIA NIM", "zai": "Z.AI", "anthropic": "Anthropic", "minimax": "MiniMax", "qwen": "Alibaba Qwen", "gemini": "Google Gemini"}
+	names := map[string]string{"deepseek": "DeepSeek", "xiaomi": "Xiaomi MiMo", "tencent": "Tencent Hy", "openai": "OpenAI", "nvidia": "NVIDIA NIM", "zai": "Z.AI", "anthropic": "Anthropic", "minimax": "MiniMax", "qwen": "Alibaba Qwen", "gemini": "Google Gemini", "meta-llama": "Meta Llama", "meta-model-api": "Meta Model API", "mistral": "Mistral AI", "moonshot": "Moonshot AI", "poolside": "Poolside", "stepfun": "StepFun"}
 	if name := names[id]; name != "" {
 		return name
 	}

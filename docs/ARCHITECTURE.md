@@ -29,7 +29,7 @@ The default deployment is one Go process. It contains:
 - API-user registry with independently revocable, hash-only Gateway API keys.
 - SQLite-backed provider and model registry, initially seeded from YAML.
 - Multi-route model router with priorities, weighted selection, and configured fallback chains.
-- Advanced virtual model aliases with public Alias IDs and ordered/weighted model members.
+- Legacy virtual-model alias compatibility for existing databases; it is no longer exposed in the simplified console.
 - OpenAI-compatible proxy adapter.
 - Anthropic Messages request/response translation.
 - SQLite usage store in WAL mode.
@@ -46,8 +46,8 @@ During local development, `scripts/dev.sh` runs the Go gateway on port 8080 and 
 2. Authenticate either a bootstrap Gateway API key or a managed API-user key. Managed keys are matched by SHA-256 hash and disabled users are rejected.
 3. Enforce the configured request body limit.
 4. Parse the requested public model ID.
-5. Resolve the requested ID as either a Public Model ID or a cross-model Route ID and validate endpoint capability.
-6. For an advanced Alias ID, order member models by priority and select among equal-priority models by relative weight.
+5. Resolve the requested exact model ID and validate endpoint capability. Older databases may still contain deprecated cross-model Route IDs during the compatibility transition.
+6. For a deprecated Route ID, the current runtime can still order legacy member records until the dedicated data migration removes this path.
 7. For each selected model, order provider endpoints by route priority and select among equal-priority endpoints by relative weight.
 8. On connection errors, timeouts, rejected credentials, throttling, or upstream server errors, advance through endpoints and then member models.
 9. Rewrite the public model ID to the selected provider model ID.
@@ -59,11 +59,11 @@ During local development, `scripts/dev.sh` runs the Go gateway on port 8080 and 
 
 Prompt and response bodies are not persisted.
 
-## Open-core boundary
+## Product boundary
 
-The public Go module is the source of truth for the request path, provider contracts, local storage, and Community console. Commercial SwiftScale products should import this kernel and add private implementations around its interfaces rather than maintain a fork.
+OpenSwiftScale is technically independent from SwiftScale. It does not share backend services, databases, accounts, configuration, queues, internal packages, or runtime state with SwiftScale products.
 
-Enterprise extensions may provide centralized identity, SSO/SCIM, fleet configuration, audit export, policy approval, high-availability coordination, and commercial support. SwiftScale Cloud may provide managed inference, global routing, billing, and proprietary routing intelligence.
+OpenSwiftScale Cloud and the self-hosted edition share public contracts and product conventions rather than a required live backend dependency: brand, user experience, model hierarchy, exact-model routing invariant, and OpenAI-compatible API behavior. Cloud-only account, balance, payment, and managed-endpoint services stay outside the self-hosted process.
 
 ## Persistence
 
@@ -75,11 +75,13 @@ Public model metadata and provider routes are stored separately. `model_configs`
 
 `model_route_policies` records which model route groups an administrator explicitly created through the console and stores the selected failover, load-balancing, or hybrid strategy. Seeded catalog models are not automatically promoted to route rules.
 
-`routing_rules` owns public Route IDs and `routing_rule_members` maps each rule to different Public Model IDs with a priority and weight. Rules cannot recursively contain other rules in the Community implementation, which keeps resolution bounded and inspectable.
+`model_route_preferences` stores the simplified per-model choice between platform defaults and manual endpoint ordering. Participation, priority, and weight remain properties of each `model_routes` row, so disabling a route does not delete its connection or prevent it from being enabled again.
+
+`routing_rules` and `routing_rule_members` are legacy compatibility tables for virtual aliases created by earlier builds. The simplified console no longer exposes them. Removing them, along with cross-model fallback data, requires a separate migration so existing installations are not damaged by an interface-only release.
 
 The official YAML catalog is seed data rather than the runtime source of truth. On first start, official provider templates and models are inserted into SQLite. Saving a connection through the management API refreshes the in-memory routing snapshot atomically, so inference does not require a restart. Startup and readiness never depend on upstream API-key validation.
 
-Future team and HA profiles may add PostgreSQL. Redis must remain optional and should only be introduced for cross-instance coordination that cannot be handled by PostgreSQL.
+The default runtime remains intentionally single-node. PostgreSQL, Redis, and distributed coordination are not part of the self-hosted product unless a concrete developer use case justifies their operational cost.
 
 ## Extension boundaries
 
@@ -94,4 +96,4 @@ The initial implementation separates:
 - `gateway`: HTTP orchestration.
 - `webui`: embedded management console.
 
-Go's runtime plugin mechanism is intentionally avoided because it complicates portability and supply-chain review. Enterprise builds should use compile-time composition or a separately authenticated control-plane service.
+Go's runtime plugin mechanism is intentionally avoided because it complicates portability and supply-chain review.

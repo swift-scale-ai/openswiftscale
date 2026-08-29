@@ -43,9 +43,111 @@ providers:
     chat_path: /chat/completions
     responses_path: /responses
     embeddings_path: /embeddings
+  - id: meta-llama
+    type: openai-compatible
+    base_url: https://api.llama.com/compat/v1
+    chat_path: /chat/completions
+    responses_path: /responses
+    embeddings_path: /embeddings
+  - id: meta-model-api
+    type: openai-compatible
+    base_url: https://api.meta.ai/v1
+    chat_path: /chat/completions
+    responses_path: /responses
+    embeddings_path: /embeddings
+  - id: mistral
+    type: openai-compatible
+    base_url: https://api.mistral.ai/v1
+    chat_path: /chat/completions
+    responses_path: /responses
+    embeddings_path: /embeddings
+  - id: moonshot
+    type: openai-compatible
+    base_url: https://api.moonshot.ai/v1
+    chat_path: /chat/completions
+    responses_path: /responses
+    embeddings_path: /embeddings
+  - id: poolside
+    type: openai-compatible
+    base_url: https://inference.poolside.ai
+  - id: stepfun
+    type: openai-compatible
+    base_url: https://api.stepfun.ai/step_plan/v1
+    chat_path: /chat/completions
+    responses_path: /responses
+    embeddings_path: /embeddings
+
+# Public model-family directory, verified against each publisher's official API
+# catalog on 2026-08-29. routeable means this gateway already supports at least
+# one protocol used by the family; it does not imply that an API key is configured.
+families:
+  - {id: qwen, name: Qwen, publisher: Alibaba, provider: qwen, capabilities: [text, vision, audio], routeable: true}
+  - {id: qwen-image, name: Qwen Image, publisher: Alibaba, provider: qwen, capabilities: [image], routeable: false}
+  - {id: wan, name: Wan, publisher: Alibaba, provider: qwen, capabilities: [image, video], routeable: false}
+  - {id: happyhorse, name: HappyHorse, publisher: Alibaba, provider: qwen, capabilities: [video], routeable: false}
+  - {id: claude, name: Claude, publisher: Anthropic, provider: anthropic, capabilities: [text, vision], routeable: true}
+  - {id: deepseek, name: DeepSeek, publisher: DeepSeek, provider: deepseek, capabilities: [text], routeable: true}
+  - {id: gemini, name: Gemini, publisher: Google, provider: gemini, capabilities: [text, vision, audio], routeable: true}
+  - {id: nano-banana, name: Nano Banana, publisher: Google, provider: gemini, capabilities: [image], routeable: false}
+  - {id: veo, name: Veo, publisher: Google, provider: gemini, capabilities: [video], routeable: false}
+  - {id: lyria, name: Lyria, publisher: Google, provider: gemini, capabilities: [music], routeable: false}
+  - {id: google-embedding, name: Gemini Embedding, publisher: Google, provider: gemini, capabilities: [embeddings], routeable: true}
+  - {id: minimax, name: MiniMax M, publisher: MiniMax, provider: minimax, capabilities: [text], routeable: true}
+  - {id: hailuo, name: Hailuo, publisher: MiniMax, provider: minimax, capabilities: [video], routeable: false}
+  - {id: minimax-speech, name: MiniMax Speech, publisher: MiniMax, provider: minimax, capabilities: [speech], routeable: false}
+  - {id: minimax-music, name: MiniMax Music, publisher: MiniMax, provider: minimax, capabilities: [music], routeable: false}
+  - {id: minimax-image, name: MiniMax Image, publisher: MiniMax, provider: minimax, capabilities: [image], routeable: false}
+  - {id: nemotron, name: Nemotron, publisher: NVIDIA, provider: nvidia, capabilities: [text], routeable: true}
+  - {id: cosmos, name: Cosmos, publisher: NVIDIA, provider: nvidia, capabilities: [vision, video, world-model], routeable: false}
+  - {id: nemo-retriever, name: NeMo Retriever, publisher: NVIDIA, provider: nvidia, capabilities: [embeddings, retrieval, document-parsing], routeable: true}
+  - {id: riva, name: Riva, publisher: NVIDIA, provider: nvidia, capabilities: [translation, speech], routeable: true}
+  - {id: usdcode, name: USD Code, publisher: NVIDIA, provider: nvidia, capabilities: [text, code], routeable: true}
+  - {id: gpt, name: GPT, publisher: OpenAI, provider: openai, capabilities: [text, vision, reasoning], routeable: true}
+  - {id: o-series, name: o-series, publisher: OpenAI, provider: openai, capabilities: [text, reasoning], routeable: true}
+  - {id: gpt-image, name: GPT Image, publisher: OpenAI, provider: openai, capabilities: [image], routeable: false}
+  - {id: sora, name: Sora, publisher: OpenAI, provider: openai, capabilities: [video], routeable: false}
+  - {id: openai-realtime, name: Realtime, publisher: OpenAI, provider: openai, capabilities: [text, audio], routeable: false}
+  - {id: openai-audio, name: Audio, publisher: OpenAI, provider: openai, capabilities: [speech, transcription], routeable: false}
+  - {id: openai-embedding, name: Embedding, publisher: OpenAI, provider: openai, capabilities: [embeddings], routeable: true}
+  - {id: openai-moderation, name: Moderation, publisher: OpenAI, provider: openai, capabilities: [moderation], routeable: false}
+  - {id: hy, name: Tencent HY, publisher: Tencent, provider: tencent, capabilities: [text, reasoning], routeable: true}
+  - {id: hy-vision, name: Tencent HY Vision, publisher: Tencent, provider: tencent, capabilities: [vision], routeable: true}
+  - {id: hy-image, name: Tencent HY Image, publisher: Tencent, provider: tencent, capabilities: [image], routeable: false}
+  - {id: mimo, name: MiMo, publisher: Xiaomi, provider: xiaomi, capabilities: [text, vision], routeable: true}
+  - {id: mimo-tts, name: MiMo TTS, publisher: Xiaomi, provider: xiaomi, capabilities: [speech], routeable: false}
+  - {id: mimo-asr, name: MiMo ASR, publisher: Xiaomi, provider: xiaomi, capabilities: [transcription], routeable: false}
+  - {id: glm, name: GLM, publisher: Z.AI, provider: zai, capabilities: [text, reasoning], routeable: true}
+  - {id: glm-v, name: GLM-V, publisher: Z.AI, provider: zai, capabilities: [vision], routeable: true}
+  - {id: glm-image, name: GLM Image, publisher: Z.AI, provider: zai, capabilities: [image], routeable: false}
+  - {id: cogview, name: CogView, publisher: Z.AI, provider: zai, capabilities: [image], routeable: false}
+  - {id: cogvideox, name: CogVideoX, publisher: Z.AI, provider: zai, capabilities: [video], routeable: false}
+  - {id: glm-asr, name: GLM ASR, publisher: Z.AI, provider: zai, capabilities: [transcription], routeable: false}
+  # Additional open and open-weight publishers. Hosted providers use their
+  # publisher's public API; deployment/self-hosted families expose an official
+  # endpoint template without pretending that a shared SaaS endpoint exists.
+  - {id: llama, name: Llama, publisher: Meta, provider: meta-llama, capabilities: [text, vision, reasoning], routeable: true}
+  - {id: muse-spark, name: Muse Spark, publisher: Meta, provider: meta-model-api, capabilities: [text, vision, audio, video, reasoning, code], routeable: true}
+  - {id: muse-image, name: Muse Image, publisher: Meta, provider: meta-model-api, capabilities: [image, vision], routeable: false}
+  - {id: phi, name: Phi, publisher: Microsoft, capabilities: [text, vision, reasoning], routeable: false, official_access: deployment, official_endpoint: "https://{resource}.services.ai.azure.com/openai/v1"}
+  - {id: mai-thinking, name: MAI Thinking, publisher: Microsoft, capabilities: [text, reasoning], routeable: false, official_access: deployment, official_endpoint: "https://{resource}.services.ai.azure.com/mai/v1/chat/completions"}
+  - {id: mai-image, name: MAI Image, publisher: Microsoft, capabilities: [image, vision], routeable: false, official_access: deployment, official_endpoint: "https://{resource}.services.ai.azure.com/mai/v1/images"}
+  - {id: mai-voice, name: MAI Voice, publisher: Microsoft, capabilities: [speech], routeable: false, official_access: deployment, official_endpoint: "https://{region}.tts.speech.microsoft.com/cognitiveservices/v1"}
+  - {id: mai-transcribe, name: MAI Transcribe, publisher: Microsoft, capabilities: [transcription], routeable: false, official_access: deployment, official_endpoint: "https://{resource}.cognitiveservices.azure.com/speechtotext/transcriptions:transcribe"}
+  - {id: mistral, name: Mistral, publisher: Mistral AI, provider: mistral, capabilities: [text, code, reasoning], routeable: true}
+  - {id: kimi, name: Kimi, publisher: Moonshot AI, provider: moonshot, capabilities: [text, vision, reasoning], routeable: true}
+  - {id: laguna, name: Laguna, publisher: Poolside, provider: poolside, capabilities: [text, code, reasoning], routeable: true}
+  - {id: step, name: Step, publisher: StepFun, provider: stepfun, capabilities: [text, vision, reasoning], routeable: true}
 
 models:
-  # Verified against the providers' official model catalogs on 2026-08-23.
+  # Verified against the providers' official model catalogs on 2026-08-29.
+  - id: muse-spark-1.2
+    name: Muse Spark 1.2
+    family: muse-spark
+    provider: meta-model-api
+    upstream_model: muse-spark-1.2
+    capabilities: [chat, responses, streaming, tools, structured_output, vision, reasoning]
+    context_window: 1048576
+    pricing: {currency: USD}
   - id: gpt-5.6-sol
     name: GPT 5.6 Sol
     family: gpt

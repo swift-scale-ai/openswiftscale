@@ -4,7 +4,7 @@ OpenSwiftScale exposes an OpenAI-compatible inference API for applications insid
 
 ## Base URL
 
-The standard installer detects the gateway host's active LAN address. The Overview page therefore shows a client-reachable address similar to:
+The standard installer detects the gateway host's active LAN address. The resulting client-reachable address is similar to:
 
 ```text
 http://192.168.1.25:8080/v1
@@ -71,7 +71,7 @@ Set `stream` to `true` to receive upstream Server-Sent Events. OpenSwiftScale st
 
 ## Client examples
 
-The Overview page lists only models that currently have a ready provider route. Select a model there to populate its exact Public Model ID into the built-in cURL, Python, Go, Node.js, Java, and Rust examples.
+The Models workspace shows which exact model IDs currently have a ready endpoint. Use one of those IDs with the cURL, Python, Go, Node.js, Java, or Rust examples below.
 
 ### Python OpenAI SDK
 
@@ -172,20 +172,17 @@ Use the console-generated examples when possible: they automatically use the cur
 
 The request's `model` value is the Public Model ID. OpenSwiftScale resolves its configured endpoint pool as follows:
 
-1. Lower priority numbers are attempted first.
-2. Available endpoints at the same priority share new requests according to weight.
-3. Connection failures, timeouts, and retryable upstream responses advance to another eligible endpoint.
-4. Advanced virtual aliases may resolve one client-facing ID across different Public Model IDs.
+1. The request selects one exact model ID.
+2. Endpoints capable of serving that exact model are inspected in their visible order.
+3. Connection failures, timeouts, and retryable upstream responses advance to another eligible endpoint for the same model.
+4. Ordinary model requests are never silently replaced with a different model ID.
 
 Successful inference responses identify the selected route with these headers:
 
 - `X-OpenSwiftScale-Provider`
 - `X-OpenSwiftScale-Route-Priority`
-- `X-OpenSwiftScale-Routing-Rule` when a virtual alias is used
-- `X-OpenSwiftScale-Resolved-Model` when a virtual alias is used
-- `X-OpenSwiftScale-Model-Priority` when a virtual alias is used
 
-See [Configuration](CONFIGURATION.md#multi-route-models) for priority, weight, failover, and alias details.
+See [Configuration](CONFIGURATION.md#same-model-endpoint-routing) for endpoint ordering and failover details. Cross-model alias headers may still appear for installations carrying deprecated compatibility rules; new configurations should not depend on them.
 
 ## Errors and request limits
 

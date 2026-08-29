@@ -29,25 +29,24 @@ Provider credentials are not required at startup. Configure them later in the em
 
 The console uses HTTP Basic authentication for its management API. `scripts/install.sh` generates a random production password in `secrets/admin_password.txt`; `scripts/dev.sh` uses `admin` / `openswiftscale` for local development. Existing installations may temporarily continue using `OPENSWIFTSCALE_MANAGEMENT_TOKEN` as the administrator password while migrating.
 
-## API users and client keys
+## Client API keys
 
-Use **Console → API access** to create credentials for applications and people calling `/v1/*`. API users are separate from the administrator account and provider connections:
+Use **API keys** in the top navigation to create credentials for applications calling `/v1/*`:
 
-- An API user is an identity and may own multiple keys.
-- Disabling a user blocks every key belonging to that user.
 - Keys can be created and revoked independently; their full value is shown only once.
 - SQLite stores only a SHA-256 hash, prefix, label, creation time, and last-used time for each managed key.
-- Deleting a user revokes and removes all keys belonging to that user.
+
+The console intentionally presents a flat key list. The current database retains an internal key-owner record for backward-compatible storage, but users do not need to create or manage that record.
 
 Keys configured through `OPENSWIFTSCALE_API_KEYS` or `OPENSWIFTSCALE_API_KEYS_FILE` remain bootstrap credentials and are not listed in the API access page. They are retained for installation and backward compatibility; managed keys are recommended for normal workloads.
 
-The standard start script detects the host's active LAN address, publishes port `8080` on that address, and sets `OPENSWIFTSCALE_PUBLIC_URL` so the Overview page shows an address other machines can reach. Override `OPENSWIFTSCALE_BIND_ADDRESS` and `OPENSWIFTSCALE_PUBLIC_URL` when using a fixed private DNS name, reverse proxy, VPN address, or internal load balancer.
+The standard start script detects the host's active LAN address, publishes port `8080` on that address, and sets `OPENSWIFTSCALE_PUBLIC_URL` to an address other machines can reach. Override `OPENSWIFTSCALE_BIND_ADDRESS` and `OPENSWIFTSCALE_PUBLIC_URL` when using a fixed private DNS name, reverse proxy, VPN address, or internal load balancer.
 
 Port `5173` is only the Vite development server for the web console. It proxies browser development requests to the Go service and must never be advertised as the inference endpoint. Client applications use the Go gateway at the configured `OPENSWIFTSCALE_PUBLIC_URL`, normally `http://<host-lan-ip>:8080/v1`.
 
 ## Provider connections
 
-The normal setup path is **Console → Connections**. Official provider protocol, endpoint, authentication, and model settings are seeded into SQLite on first start. Entering or replacing an API key does not perform a network request; the connection is initially marked `unverified`.
+The normal setup path is the console's **Models** workspace. Select an exact model ID and configure one of the endpoints displayed on the right. Official provider protocol, endpoint, authentication, and model settings are seeded into SQLite on first start. Entering or replacing an API key does not perform a network request; the connection is initially marked `unverified`.
 
 Custom endpoints support the OpenAI-compatible and Anthropic Messages protocols. HTTPS is required unless the user explicitly allows HTTP for a trusted local endpoint.
 
@@ -63,42 +62,30 @@ Provider secrets are encrypted with AES-256-GCM using per-secret random nonces a
 2. Its capability includes the requested endpoint.
 3. Its provider connection is enabled and has a configured key.
 
-## Multi-route models
+The top-level `families` list is discovery metadata for the console's publisher → family hierarchy. Each family references its official `provider`, so the console can show the publisher-operated endpoint even before an exact model ID is configured. A family with `routeable: false` is publicly offered by its publisher but uses a dedicated image, video, speech, music, or moderation protocol that this gateway does not yet implement. It remains visible for catalog completeness, but it is never advertised by `/v1/models` and cannot receive traffic until an exact model route and protocol adapter exist.
 
-Multiple connections can publish the same **Public model ID**. Each connection contributes one route with these controls:
+## Same-model endpoint routing
+
+Multiple connections can publish the same exact **model ID**. The main workspace groups those endpoints together and displays their order, provider, address, price metadata, and readiness.
 
 | Setting | Meaning |
 | --- | --- |
 | Priority | Lower numbers are attempted before higher numbers. The default is `100`. |
 | Weight | Relative traffic share among available routes at the same priority. The default is `100`. |
 
-The Public Model ID is the aggregation key. Built-in connections show their Public Model ID and provider-specific Upstream Model ID in the connection dialog. To attach a third-party endpoint to an existing routing group, configure that endpoint with the exact same Public Model ID; its Upstream Model ID may be different. Public IDs on built-in routes are read-only, while priority and weight remain editable.
+The exact model ID is the aggregation key. To attach a third-party endpoint, configure it with the same model ID; its provider-specific upstream identifier may differ. Endpoint routing must never substitute a different model ID.
 
-The Models page provides a four-step routing wizard:
-
-1. Select the exact Public Model ID clients will send in the request.
-2. Choose failover, load-balancing, or hybrid behavior.
-3. Review existing endpoints, add third-party endpoints, and fine-tune priority and weight.
-4. Confirm the resolved endpoint chain and save it.
-
-The wizard changes endpoint routing only for the selected Public Model ID. It does not inspect prompts or silently move ordinary model requests to a different model family.
-
-The Route rules list contains only policies explicitly saved through this wizard. Seeded catalog models remain available for selection but are not presented as user-created routing rules. Removing a route rule removes its policy record while preserving the underlying provider connections and model endpoints.
+The simplified console does not expose failover, load-balancing, hybrid, or virtual-alias terminology. Use **Route settings** beside the selected exact model ID to enable or exclude endpoints, drag them into fallback order, and set their initial traffic weights. In manual mode, weights select the first endpoint and the dragged order determines subsequent attempts after a retryable failure. Enabling **Use platform default strategy** restores equal default priority and weight while preserving the selected participating endpoints.
 
 For example, two routes with priority `10` and weights `80` and `20` receive approximately 80% and 20% of new requests. A third route with priority `20` normally receives no initial traffic; it becomes the next failover target after priority-10 routes fail.
 
 Automatic failover advances on connection and timeout errors and on upstream HTTP `401`, `403`, `408`, `429`, and `5xx` responses. Other client errors are returned directly because retrying the same invalid request against another provider can hide a request problem. The gateway does not persist or replay prompts beyond the current HTTP request.
 
-Successful inference responses include `X-OpenSwiftScale-Provider` and `X-OpenSwiftScale-Route-Priority`, and the Usage page records the provider that ultimately served each request. Responses resolved through a cross-model rule also include `X-OpenSwiftScale-Routing-Rule`, `X-OpenSwiftScale-Resolved-Model`, and `X-OpenSwiftScale-Model-Priority`. These make route switching and failover observable without exposing provider credentials.
+Successful inference responses include `X-OpenSwiftScale-Provider` and `X-OpenSwiftScale-Route-Priority`, and request records identify the provider that ultimately served each request.
 
-## Advanced virtual model aliases
+## Deprecated cross-model configuration
 
-A virtual model alias exposes an Alias ID that clients can use in the OpenAI-compatible `model` field. Its members are different Public Model IDs, each with a priority and weight. Resolution has two levels:
-
-1. The rule selects a member model by member priority and weight.
-2. That model selects a provider endpoint by route priority and weight.
-
-If every endpoint for a member model fails, the request advances to the next eligible member. Equal-priority members provide cross-model traffic distribution. Rule IDs must not duplicate Public Model IDs, rules cannot contain other rules, and every member must reference an existing model.
+Older builds exposed virtual model aliases and model fallback chains. They are no longer part of the product interface because they can replace the model explicitly selected by a developer. Existing database records and compatibility APIs are retained during the interface transition and will be addressed by a separate data migration.
 
 Price fields are local estimates, not provider invoices. Verify prices and model limits before production deployment.
 

@@ -190,16 +190,25 @@ func (r *Router) routesForModel(modelID, capability string) []Route {
 		if !ok || key == "" {
 			continue
 		}
-		if _, exists := byPriority[candidate.Priority]; !exists {
-			priorities = append(priorities, candidate.Priority)
+		priority := candidate.Priority
+		if candidate.ManualRouting {
+			priority = 100
 		}
-		byPriority[candidate.Priority] = append(byPriority[candidate.Priority], Route{Model: candidate, Provider: provider, APIKey: key})
+		if _, exists := byPriority[priority]; !exists {
+			priorities = append(priorities, priority)
+		}
+		byPriority[priority] = append(byPriority[priority], Route{Model: candidate, Provider: provider, APIKey: key})
 	}
 	sort.Ints(priorities)
 	var ordered []Route
 	for _, priority := range priorities {
 		group := byPriority[priority]
-		sort.Slice(group, func(i, j int) bool { return group[i].Provider.ID < group[j].Provider.ID })
+		sort.Slice(group, func(i, j int) bool {
+			if group[i].Model.RouteOrder != group[j].Model.RouteOrder {
+				return group[i].Model.RouteOrder < group[j].Model.RouteOrder
+			}
+			return group[i].Provider.ID < group[j].Provider.ID
+		})
 		selected := r.weightedIndex(modelID, priority, group)
 		for offset := range group {
 			ordered = append(ordered, group[(selected+offset)%len(group)])
@@ -289,7 +298,10 @@ func cloneCatalog(source *catalog.Catalog) *catalog.Catalog {
 	if source == nil {
 		return &catalog.Catalog{}
 	}
-	out := &catalog.Catalog{Providers: append([]catalog.Provider(nil), source.Providers...), Models: append([]catalog.Model(nil), source.Models...)}
+	out := &catalog.Catalog{Providers: append([]catalog.Provider(nil), source.Providers...), Families: append([]catalog.ModelFamily(nil), source.Families...), Models: append([]catalog.Model(nil), source.Models...)}
+	for index := range out.Families {
+		out.Families[index].Capabilities = append([]string(nil), out.Families[index].Capabilities...)
+	}
 	for index := range out.Models {
 		out.Models[index].Capabilities = append([]string(nil), out.Models[index].Capabilities...)
 		out.Models[index].Fallbacks = append([]string(nil), out.Models[index].Fallbacks...)
