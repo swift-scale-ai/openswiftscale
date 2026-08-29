@@ -10,7 +10,7 @@ A transparent, open-source, self-hosted AI gateway for developers.
 [![Release](https://img.shields.io/github/v/release/swift-scale-ai/OpenSwiftScale)](https://github.com/swift-scale-ai/OpenSwiftScale/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-[Quick start](#quick-start) · [Gateway API](docs/API.md) · [Documentation](#documentation) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
+[Quick start](#quick-start) · [Gateway API](docs/API.md) · [Documentation](docs/README.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
 </div>
 
@@ -20,6 +20,7 @@ OpenSwiftScale gives developers and teams one OpenAI-compatible endpoint for dir
 
 | Guide | Purpose |
 | --- | --- |
+| [Documentation home](docs/README.md) | What OpenSwiftScale is, what it does, installation, first-time setup, routing, examples, and troubleshooting. |
 | [Gateway API](docs/API.md) | Authentication, callable model IDs, SDK examples, errors, and routing headers. |
 | [Configuration](docs/CONFIGURATION.md) | Runtime variables, model endpoints, API keys, and local routing. |
 | [Data and storage](docs/DATA_AND_STORAGE.md) | SQLite contents, secret handling, backup, restore, reset, and retention. |
@@ -27,10 +28,10 @@ OpenSwiftScale gives developers and teams one OpenAI-compatible endpoint for dir
 | [Development](docs/DEVELOPMENT.md) | Source layout, local ports, toolchain, tests, and build workflow. |
 | [Releases](docs/RELEASES.md) | Versioning, automated artifacts, container images, and verification. |
 | [Architecture](docs/ARCHITECTURE.md) | Runtime components, request path, persistence model, and extension boundaries. |
-| [Product design](docs/PRODUCT.md) | Product principles, Community scope, non-goals, and success criteria. |
-| [Open-source policy](docs/OPEN_SOURCE.md) | License rights, Community guarantees, trademarks, contributions, and dependencies. |
+| [Product design](docs/PRODUCT.md) | Product forms, principles, audience, scope, non-goals, and success criteria. |
+| [Open-source policy](docs/OPEN_SOURCE.md) | License rights, self-hosted guarantees, trademarks, contributions, and dependencies. |
 | [Security](SECURITY.md) | Vulnerability reporting and secure deployment baseline. |
-| [Support](SUPPORT.md) | Community support scope and safe issue-reporting guidance. |
+| [Support](SUPPORT.md) | Project support scope and safe issue-reporting guidance. |
 | [Code of Conduct](CODE_OF_CONDUCT.md) | Expected behavior in project spaces. |
 
 ## Why OpenSwiftScale
@@ -63,6 +64,8 @@ The start script also detects the host's active LAN IP, publishes the gateway on
 To follow gateway logs, run `./scripts/logs.sh`.
 
 Open the console at <http://127.0.0.1:8080>. Sign in with the administrator username and randomly generated password printed by the installer. Select a model ID, configure one of its endpoints with a provider API key, then create a revocable Gateway API key from the top navigation. Saving a provider connection does not contact the provider or block startup.
+
+When running from source with `./scripts/dev.sh`, the default console login is username `admin` and password `openswiftscale`. The standard installer does not reuse this development password; it generates and prints a random password instead.
 
 Custom OpenAI-compatible and Anthropic-compatible endpoints can be added from the same page. Provider credentials are encrypted with AES-256-GCM before being stored in SQLite; the master key is kept separately under `/data/keys/master.key` by default.
 
@@ -101,7 +104,7 @@ If another local application already uses port 8080, choose a different backend 
 OPENSWIFTSCALE_LISTEN_ADDR=127.0.0.1:8081 ./scripts/dev.sh
 ```
 
-The default development console account is `admin` with password `openswiftscale`. Production installation generates a unique random administrator password instead.
+The default development console login is username `admin` with password `openswiftscale`. Production installation generates a unique random administrator password instead.
 
 Production builds remain a single self-contained Go executable. Vite writes its optimized output to `internal/webui/dist`, and Go embeds that directory at compile time:
 
@@ -117,6 +120,11 @@ Production builds remain a single self-contained Go executable. Vite writes its 
 | `POST` | `/v1/chat/completions` | Implemented, including SSE |
 | `POST` | `/v1/responses` | Implemented for compatible providers |
 | `POST` | `/v1/embeddings` | Implemented for catalog entries with embedding capability |
+| `POST` | `/v1/images/generations` | Implemented for image-capable compatible providers |
+| `POST` | `/v1/rerank` | Implemented for rerank-capable compatible providers |
+| `POST` | `/v1/videos` | Implemented for video-capable compatible providers |
+| `POST` | `/v1/audio/speech` | Implemented for speech-capable compatible providers |
+| `POST` | `/v1/audio/transcriptions` | Implemented with multipart upload for transcription-capable providers |
 | `GET` | `/healthz` | Implemented |
 | `GET` | `/readyz` | Implemented |
 | `GET` | `/metrics` | Implemented |
@@ -134,7 +142,7 @@ The embedded console uses separate management authentication and exposes a singl
 
 ## Initial model catalog
 
-The seed catalog separates published model families from callable model routes. It covers the current public families of Alibaba, Anthropic, DeepSeek, Google, MiniMax, NVIDIA, OpenAI, Tencent, Xiaomi, and Z.AI—including multimodal families such as Wan, HappyHorse, Veo, Hailuo, Sora, and CogVideoX. Families whose dedicated protocol is not implemented remain discoverable in the console but are not advertised as callable models. Official publisher endpoints stay separate from third-party or locally operated compatible endpoints.
+The seed catalog separates published model families from callable model routes. It covers the current public families of Alibaba, Anthropic, DeepSeek, Google, MiniMax, NVIDIA, OpenAI, Tencent, Xiaomi, and Z.AI—including multimodal families such as Wan, HappyHorse, Veo, Hailuo, Sora, and CogVideoX. Text, image, embeddings, rerank, video, speech, and transcription routes become callable when an exact model ID and compatible endpoint are configured. Families that still require a provider-specific contract remain discoverable but are not advertised by `/v1/models`. Official publisher endpoints stay separate from third-party or locally operated compatible endpoints.
 
 OpenSwiftScale does **not** integrate with or depend on OpenRouter and does not route prompts through an aggregator. Provider model IDs, prices, context limits, and availability change independently; treat [`config/catalog.yaml`](config/catalog.yaml) as versioned seed data and verify each provider contract before production use.
 
@@ -146,7 +154,7 @@ See [Data and storage](docs/DATA_AND_STORAGE.md) before backing up, resetting, o
 
 ## Project status
 
-This repository currently contains the first functional Community MVP. It is suitable for local evaluation and contribution. Before production use, pin image digests, review provider-specific contracts, configure TLS at the ingress, test failure behavior, and establish database backups.
+This repository contains the open-source self-hosted OpenSwiftScale runtime. Before production use, pin image digests, review provider-specific contracts, configure TLS at the ingress, test failure behavior, and establish database backups.
 
 ## License
 

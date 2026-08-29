@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -11,6 +12,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
+	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -60,19 +64,19 @@ func (g *Gateway) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/chat/completions", g.withAPIAuth(g.inference("chat")))
 	mux.HandleFunc("POST /v1/responses", g.withAPIAuth(g.inference("responses")))
 	mux.HandleFunc("POST /v1/embeddings", g.withAPIAuth(g.inference("embeddings")))
+	mux.HandleFunc("POST /v1/images/generations", g.withAPIAuth(g.inference("image")))
+	mux.HandleFunc("POST /v1/rerank", g.withAPIAuth(g.inference("rerank")))
+	mux.HandleFunc("POST /v1/videos", g.withAPIAuth(g.inference("video")))
+	mux.HandleFunc("POST /v1/audio/speech", g.withAPIAuth(g.inference("speech")))
+	mux.HandleFunc("POST /v1/audio/transcriptions", g.withAPIAuth(g.inference("transcription")))
 	mux.HandleFunc("GET /api/admin/status", g.withManagementAuth(g.adminStatus))
 	mux.HandleFunc("GET /api/admin/models", g.withManagementAuth(g.adminModels))
 	mux.HandleFunc("GET /api/admin/model-families", g.withManagementAuth(g.adminModelFamilies))
 	mux.HandleFunc("GET /api/admin/model-routes/{id}", g.withManagementAuth(g.adminModelRouteSettings))
 	mux.HandleFunc("PATCH /api/admin/model-routes/{id}", g.withManagementAuth(g.saveModelRouteSettings))
-	mux.HandleFunc("GET /api/admin/model-route-policies", g.withManagementAuth(g.adminModelRoutePolicies))
-	mux.HandleFunc("POST /api/admin/model-route-policies", g.withManagementAuth(g.saveModelRoutePolicy))
-	mux.HandleFunc("DELETE /api/admin/model-route-policies/{id}", g.withManagementAuth(g.deleteModelRoutePolicy))
-	mux.HandleFunc("GET /api/admin/routing-rules", g.withManagementAuth(g.adminRoutingRules))
-	mux.HandleFunc("POST /api/admin/routing-rules", g.withManagementAuth(g.saveRoutingRule))
-	mux.HandleFunc("DELETE /api/admin/routing-rules/{id}", g.withManagementAuth(g.deleteRoutingRule))
 	mux.HandleFunc("GET /api/admin/providers", g.withManagementAuth(g.adminProviders))
 	mux.HandleFunc("POST /api/admin/providers", g.withManagementAuth(g.saveProvider))
+	mux.HandleFunc("POST /api/admin/providers/{id}/validate", g.withManagementAuth(g.validateProvider))
 	mux.HandleFunc("DELETE /api/admin/providers/{id}", g.withManagementAuth(g.deleteProvider))
 	mux.HandleFunc("GET /api/admin/usage", g.withManagementAuth(g.adminUsage))
 	mux.HandleFunc("GET /api/admin/users", g.withManagementAuth(g.adminAPIUsers))
@@ -181,31 +185,6 @@ func (g *Gateway) listModels(w http.ResponseWriter, r *http.Request) {
 			"context_window": model.contextWindow, "capabilities": model.capabilities,
 		})
 	}
-	rules, err := g.store.RoutingRules(r.Context())
-	if err == nil {
-		for _, rule := range rules {
-			if !rule.Enabled || !g.router.RuleAvailable(rule.ID) {
-				continue
-			}
-			capabilities, seenCapabilities := []string{}, map[string]bool{}
-			contextWindow := 0
-			for _, member := range rule.Members {
-				for _, model := range runtimeCatalog.ModelsByID(member.ModelID) {
-					if model.ContextWindow > contextWindow {
-						contextWindow = model.ContextWindow
-					}
-					for _, capability := range model.Capabilities {
-						if !seenCapabilities[capability] {
-							capabilities = append(capabilities, capability)
-							seenCapabilities[capability] = true
-						}
-					}
-				}
-			}
-			data = append(data, map[string]any{"id": rule.ID, "object": "model", "owned_by": "openswiftscale-routing-rule",
-				"context_window": contextWindow, "capabilities": capabilities, "routing_rule": true})
-		}
-	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
@@ -226,15 +205,13 @@ func (g *Gateway) inference(endpoint string) http.HandlerFunc {
 			writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "The request body exceeds the configured limit.")
 			return
 		}
-		var envelope struct {
-			Model string `json:"model"`
-		}
-		if err := json.Unmarshal(body, &envelope); err != nil || strings.TrimSpace(envelope.Model) == "" {
+		modelID, err := requestModel(body, r.Header.Get("Content-Type"))
+		if err != nil || modelID == "" {
 			g.errors.Add(1)
-			writeError(w, http.StatusBadRequest, "invalid_request", "A JSON body with a model field is required.")
+			writeError(w, http.StatusBadRequest, "invalid_request", "A request body with a model field is required.")
 			return
 		}
-		routes, err := g.router.Resolve(envelope.Model, endpoint)
+		routes, err := g.router.Resolve(modelID, endpoint)
 		if err != nil {
 			g.errors.Add(1)
 			status, code := http.StatusBadRequest, "model_not_found"
@@ -252,8 +229,25 @@ func (g *Gateway) inference(endpoint string) http.HandlerFunc {
 		var response *http.Response
 		for index, route := range routes {
 			selected = route
+			attemptedAt := time.Now()
 			response, err = g.providers.Do(r.Context(), endpoint, route, body, r.Header)
 			g.recordProviderValidation(route.Provider.ID, response, err)
+			statusCode := 0
+			if response != nil {
+				statusCode = response.StatusCode
+			}
+			succeeded := err == nil && !provider.RetryableStatus(statusCode)
+			message := ""
+			if err != nil {
+				message = err.Error()
+			} else if !succeeded {
+				message = fmt.Sprintf("HTTP %d", statusCode)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			if outcomeErr := g.store.RecordRouteOutcome(ctx, store.RouteOutcome{ModelID: route.Model.ID, ProviderID: route.Provider.ID, Success: succeeded, Status: statusCode, LatencyMS: time.Since(attemptedAt).Milliseconds(), Error: message}); outcomeErr != nil {
+				g.logger.Warn("record route outcome", "model", route.Model.ID, "provider", route.Provider.ID, "error", outcomeErr)
+			}
+			cancel()
 			if err == nil && !(provider.RetryableStatus(response.StatusCode) && index < len(routes)-1) {
 				break
 			}
@@ -261,6 +255,9 @@ func (g *Gateway) inference(endpoint string) http.HandlerFunc {
 				_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
 				_ = response.Body.Close()
 			}
+		}
+		if refreshErr := g.refreshRuntime(r.Context()); refreshErr != nil {
+			g.logger.Warn("refresh routing quality", "error", refreshErr)
 		}
 		if err != nil || response == nil {
 			g.errors.Add(1)
@@ -270,11 +267,6 @@ func (g *Gateway) inference(endpoint string) http.HandlerFunc {
 		}
 		w.Header().Set("X-OpenSwiftScale-Provider", selected.Provider.ID)
 		w.Header().Set("X-OpenSwiftScale-Route-Priority", strconv.Itoa(selected.Model.Priority))
-		if selected.RuleID != "" {
-			w.Header().Set("X-OpenSwiftScale-Routing-Rule", selected.RuleID)
-			w.Header().Set("X-OpenSwiftScale-Resolved-Model", selected.Model.ID)
-			w.Header().Set("X-OpenSwiftScale-Model-Priority", strconv.Itoa(selected.RulePriority))
-		}
 		usage, copyErr := g.providers.CopyResponse(w, response, selected, requestID)
 		g.record(r, selected, endpoint, response.StatusCode, usage, started)
 		if response.StatusCode >= 400 || copyErr != nil {
@@ -284,6 +276,34 @@ func (g *Gateway) inference(endpoint string) http.HandlerFunc {
 			g.logger.Warn("provider response interrupted", "request_id", requestID, "provider", selected.Provider.ID, "error", copyErr)
 		}
 	}
+}
+
+func requestModel(body []byte, contentType string) (string, error) {
+	mediaType, params, err := mime.ParseMediaType(contentType)
+	if err == nil && mediaType == "multipart/form-data" {
+		reader := multipart.NewReader(bytes.NewReader(body), params["boundary"])
+		for {
+			part, nextErr := reader.NextPart()
+			if errors.Is(nextErr, io.EOF) {
+				return "", errors.New("model field is required")
+			}
+			if nextErr != nil {
+				return "", nextErr
+			}
+			if part.FormName() != "model" {
+				continue
+			}
+			value, readErr := io.ReadAll(io.LimitReader(part, 8<<10))
+			return strings.TrimSpace(string(value)), readErr
+		}
+	}
+	var envelope struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(envelope.Model), nil
 }
 
 func (g *Gateway) recordProviderValidation(providerID string, response *http.Response, callErr error) {
@@ -354,12 +374,88 @@ func (g *Gateway) adminStatus(w http.ResponseWriter, r *http.Request) {
 			availableIDs[model.ID] = true
 		}
 	}
-	rules, _ := g.store.RoutingRules(r.Context())
+	localAPIBaseURL, lanAPIBaseURL := g.accessAPIBaseURLs(r)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name": "OpenSwiftScale", "version": Version, "uptime_seconds": int64(time.Since(g.startedAt).Seconds()),
-		"models": len(modelIDs), "available_models": len(availableIDs), "routes": len(runtimeCatalog.Models), "routing_rules": len(rules), "providers": len(runtimeCatalog.Providers), "telemetry": false, "prompt_logging": g.cfg.LogPrompts,
-		"api_base_url": g.apiBaseURL(r),
+		"models": len(modelIDs), "available_models": len(availableIDs), "routes": len(runtimeCatalog.Models), "routing_rules": 0, "providers": len(runtimeCatalog.Providers), "telemetry": false, "prompt_logging": g.cfg.LogPrompts,
+		"api_base_url": g.apiBaseURL(r), "local_api_base_url": localAPIBaseURL, "lan_api_base_url": lanAPIBaseURL,
 	})
+}
+
+func (g *Gateway) accessAPIBaseURLs(r *http.Request) (string, string) {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	listenHost, listenPort, err := net.SplitHostPort(g.cfg.ListenAddr)
+	if err != nil {
+		listenPort = "8080"
+	}
+	local := apiURLForHost(scheme, "127.0.0.1", listenPort)
+
+	if origin := strings.TrimRight(g.cfg.PublicURL, "/"); origin != "" {
+		if parsed, parseErr := url.Parse(origin); parseErr == nil && parsed.Hostname() != "" && !isLoopbackHost(parsed.Hostname()) {
+			return local, origin + "/v1"
+		}
+	}
+	if host, port, splitErr := net.SplitHostPort(g.cfg.LANListenAddr); splitErr == nil && host != "" {
+		return local, apiURLForHost(scheme, strings.Trim(host, "[]"), port)
+	}
+	if isLoopbackHost(listenHost) {
+		return local, ""
+	}
+	if address := privateLANIPv4(); address != "" {
+		return local, apiURLForHost(scheme, address, listenPort)
+	}
+	return local, ""
+}
+
+func apiURLForHost(scheme, host, port string) string {
+	if port == "" || (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		return scheme + "://" + host + "/v1"
+	}
+	return scheme + "://" + net.JoinHostPort(host, port) + "/v1"
+}
+
+func isLoopbackHost(host string) bool {
+	host = strings.TrimSpace(strings.Trim(host, "[]"))
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func privateLANIPv4() string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, networkInterface := range interfaces {
+		if networkInterface.Flags&net.FlagUp == 0 || networkInterface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addresses, addressErr := networkInterface.Addrs()
+		if addressErr != nil {
+			continue
+		}
+		for _, address := range addresses {
+			var ip net.IP
+			switch value := address.(type) {
+			case *net.IPNet:
+				ip = value.IP
+			case *net.IPAddr:
+				ip = value.IP
+			}
+			if ipv4 := ip.To4(); ipv4 != nil && ipv4.IsPrivate() && !ipv4.IsLoopback() {
+				return ipv4.String()
+			}
+		}
+	}
+	return ""
 }
 
 func (g *Gateway) apiBaseURL(r *http.Request) string {
@@ -406,6 +502,8 @@ func (g *Gateway) adminModelRouteSettings(w http.ResponseWriter, r *http.Request
 
 type modelRouteSettingsInput struct {
 	UsePlatformDefault bool                       `json:"use_platform_default"`
+	RoutingMode        string                     `json:"routing_mode"`
+	PreferredRegion    string                     `json:"preferred_region"`
 	Endpoints          []store.ModelRouteEndpoint `json:"endpoints"`
 }
 
@@ -415,7 +513,7 @@ func (g *Gateway) saveModelRouteSettings(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "invalid_request", "Valid model route settings are required.")
 		return
 	}
-	settings := store.ModelRouteSettings{ModelID: r.PathValue("id"), UsePlatformDefault: input.UsePlatformDefault, Endpoints: input.Endpoints}
+	settings := store.ModelRouteSettings{ModelID: r.PathValue("id"), UsePlatformDefault: input.UsePlatformDefault, RoutingMode: input.RoutingMode, PreferredRegion: input.PreferredRegion, Endpoints: input.Endpoints}
 	if err := g.store.SaveModelRouteSettings(r.Context(), settings); err != nil {
 		writeError(w, http.StatusBadRequest, "save_failed", err.Error())
 		return
@@ -430,141 +528,6 @@ func (g *Gateway) saveModelRouteSettings(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, updated)
-}
-
-func (g *Gateway) adminModelRoutePolicies(w http.ResponseWriter, r *http.Request) {
-	policies, err := g.store.ModelRoutePolicies(r.Context())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database_error", err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, policies)
-}
-
-type modelRoutePolicyInput struct {
-	ModelID  string `json:"model_id"`
-	Strategy string `json:"strategy"`
-}
-
-func (g *Gateway) saveModelRoutePolicy(w http.ResponseWriter, r *http.Request) {
-	var input modelRoutePolicyInput
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&input); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "A valid model route policy is required.")
-		return
-	}
-	input.ModelID = strings.ToLower(strings.TrimSpace(input.ModelID))
-	if _, exists := g.router.Catalog().ModelByID(input.ModelID); !exists {
-		writeError(w, http.StatusBadRequest, "unknown_model", fmt.Sprintf("Model %q does not exist.", input.ModelID))
-		return
-	}
-	switch input.Strategy {
-	case "failover", "load-balance", "hybrid":
-	default:
-		writeError(w, http.StatusBadRequest, "invalid_strategy", "Strategy must be failover, load-balance, or hybrid.")
-		return
-	}
-	policy := store.ModelRoutePolicy{ModelID: input.ModelID, Strategy: input.Strategy}
-	if err := g.store.SaveModelRoutePolicy(r.Context(), policy); err != nil {
-		writeError(w, http.StatusBadRequest, "save_failed", err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, policy)
-}
-
-func (g *Gateway) deleteModelRoutePolicy(w http.ResponseWriter, r *http.Request) {
-	if err := g.store.DeleteModelRoutePolicy(r.Context(), r.PathValue("id")); err != nil {
-		writeError(w, http.StatusBadRequest, "delete_failed", err.Error())
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (g *Gateway) adminRoutingRules(w http.ResponseWriter, r *http.Request) {
-	rules, err := g.store.RoutingRules(r.Context())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database_error", err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, rules)
-}
-
-type routingRuleInput struct {
-	ID      string                      `json:"id"`
-	Name    string                      `json:"name"`
-	Enabled *bool                       `json:"enabled"`
-	Members []catalog.RoutingRuleMember `json:"members"`
-}
-
-func (g *Gateway) saveRoutingRule(w http.ResponseWriter, r *http.Request) {
-	var input routingRuleInput
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256<<10)).Decode(&input); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "A valid routing rule is required.")
-		return
-	}
-	input.ID = strings.ToLower(strings.TrimSpace(input.ID))
-	if !connectionIDPattern.MatchString(input.ID) {
-		writeError(w, http.StatusBadRequest, "invalid_rule_id", "Route ID must contain only lowercase letters, numbers, dots, dashes, or underscores.")
-		return
-	}
-	if _, exists := g.router.Catalog().ModelByID(input.ID); exists {
-		writeError(w, http.StatusConflict, "rule_id_conflict", "Route ID must not duplicate a Public Model ID.")
-		return
-	}
-	if len(input.Members) == 0 {
-		writeError(w, http.StatusBadRequest, "members_required", "A routing rule requires at least one model.")
-		return
-	}
-	seen := make(map[string]bool)
-	catalogSnapshot := g.router.Catalog()
-	for index := range input.Members {
-		member := &input.Members[index]
-		member.ModelID = strings.ToLower(strings.TrimSpace(member.ModelID))
-		if seen[member.ModelID] {
-			writeError(w, http.StatusBadRequest, "duplicate_member", "Each model can appear only once in a routing rule.")
-			return
-		}
-		seen[member.ModelID] = true
-		if _, exists := catalogSnapshot.ModelByID(member.ModelID); !exists {
-			writeError(w, http.StatusBadRequest, "unknown_model", fmt.Sprintf("Model %q does not exist.", member.ModelID))
-			return
-		}
-		priority, weight, err := normalizeRoutePolicy(member.Priority, member.Weight)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_rule_member", err.Error())
-			return
-		}
-		member.Priority, member.Weight = priority, weight
-	}
-	enabled := true
-	if input.Enabled != nil {
-		enabled = *input.Enabled
-	}
-	name := strings.TrimSpace(input.Name)
-	if name == "" {
-		name = input.ID
-	}
-	rule := catalog.RoutingRule{ID: input.ID, Name: name, Enabled: enabled, Members: input.Members}
-	if err := g.store.SaveRoutingRule(r.Context(), rule); err != nil {
-		writeError(w, http.StatusBadRequest, "save_failed", err.Error())
-		return
-	}
-	if err := g.refreshRuntime(r.Context()); err != nil {
-		writeError(w, http.StatusInternalServerError, "runtime_refresh_failed", err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, rule)
-}
-
-func (g *Gateway) deleteRoutingRule(w http.ResponseWriter, r *http.Request) {
-	if err := g.store.DeleteRoutingRule(r.Context(), r.PathValue("id")); err != nil {
-		writeError(w, http.StatusBadRequest, "delete_failed", err.Error())
-		return
-	}
-	if err := g.refreshRuntime(r.Context()); err != nil {
-		writeError(w, http.StatusInternalServerError, "runtime_refresh_failed", err.Error())
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
 }
 
 func (g *Gateway) adminProviders(w http.ResponseWriter, r *http.Request) {
@@ -598,6 +561,7 @@ type providerInput struct {
 	BaseURL           string             `json:"base_url"`
 	Authentication    string             `json:"authentication"`
 	APIKeyHeader      string             `json:"api_key_header"`
+	Region            string             `json:"region"`
 	APIKey            *string            `json:"api_key"`
 	ClearAPIKey       bool               `json:"clear_api_key"`
 	Enabled           *bool              `json:"enabled"`
@@ -621,6 +585,9 @@ type modelInput struct {
 	Capabilities    []string `json:"capabilities"`
 	ContextWindow   int      `json:"context_window"`
 	MaxOutputTokens int      `json:"max_output_tokens"`
+	InputPrice      float64  `json:"input_price"`
+	OutputPrice     float64  `json:"output_price"`
+	Currency        string   `json:"currency"`
 	Priority        int      `json:"priority"`
 	Weight          int      `json:"weight"`
 }
@@ -628,6 +595,7 @@ type modelInput struct {
 var connectionIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
 
 var defaultModelCapabilities = []string{"chat", "responses", "streaming", "tools", "reasoning", "structured_output", "vision", "embeddings"}
+var allowedModelCapabilities = append(append([]string(nil), defaultModelCapabilities...), "image", "rerank", "video", "speech", "transcription")
 
 func (g *Gateway) saveProvider(w http.ResponseWriter, r *http.Request) {
 	var input providerInput
@@ -651,7 +619,7 @@ func (g *Gateway) saveProvider(w http.ResponseWriter, r *http.Request) {
 	} else if found {
 		enabled = existing.Enabled
 	}
-	p := catalog.Provider{ID: input.ID, Type: strings.ToLower(strings.TrimSpace(input.Type)), BaseURL: strings.TrimRight(strings.TrimSpace(input.BaseURL), "/"), Authentication: strings.ToLower(strings.TrimSpace(input.Authentication)), APIKeyHeader: strings.TrimSpace(input.APIKeyHeader)}
+	p := catalog.Provider{ID: input.ID, Type: strings.ToLower(strings.TrimSpace(input.Type)), BaseURL: strings.TrimRight(strings.TrimSpace(input.BaseURL), "/"), Authentication: strings.ToLower(strings.TrimSpace(input.Authentication)), APIKeyHeader: strings.TrimSpace(input.APIKeyHeader), Region: strings.ToLower(strings.TrimSpace(input.Region))}
 	official := found && existing.Official
 	modelCategory := strings.ToLower(strings.TrimSpace(input.ModelCategory))
 	if official {
@@ -661,6 +629,28 @@ func (g *Gateway) saveProvider(w http.ResponseWriter, r *http.Request) {
 			p.BaseURL = strings.TrimRight(strings.TrimSpace(input.BaseURL), "/")
 		}
 	} else {
+		if p.Region == "" && found {
+			p.Region = existing.Region
+		}
+		if p.Region == "" {
+			p.Region = "global"
+		}
+		switch p.Region {
+		case "ap-southeast-1":
+			p.Region = "apac"
+		case "eu-central-1":
+			p.Region = "europe"
+		case "us-east-1":
+			p.Region = "us"
+		case "unknown":
+			p.Region = "global"
+		}
+		switch p.Region {
+		case "global", "apac", "us", "europe", "local":
+		default:
+			writeError(w, http.StatusBadRequest, "invalid_region", "Region must be global, apac, us, europe, or local.")
+			return
+		}
 		if modelCategory == "" && found {
 			modelCategory = existing.ModelCategory
 		}
@@ -679,7 +669,7 @@ func (g *Gateway) saveProvider(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid_base_url", err.Error())
 			return
 		}
-		p.ChatPath, p.ResponsesPath, p.EmbeddingsPath = customEndpointPaths(p.BaseURL, p.Type)
+		p.ChatPath, p.ResponsesPath, p.EmbeddingsPath, p.ImagesPath, p.RerankPath, p.VideosPath, p.SpeechPath, p.TranscriptionsPath = customEndpointPaths(p.BaseURL, p.Type)
 		if p.Type == "anthropic" {
 			if p.Authentication == "" {
 				p.Authentication, p.APIKeyHeader = "x-api-key", "x-api-key"
@@ -737,6 +727,48 @@ func (g *Gateway) saveProvider(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, connection)
 }
 
+func (g *Gateway) validateProvider(w http.ResponseWriter, r *http.Request) {
+	providerID := strings.ToLower(strings.TrimSpace(r.PathValue("id")))
+	route, ok := g.router.RouteForProvider(providerID)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "provider_not_ready", "The provider needs an enabled model route and an API key before it can be tested.")
+		return
+	}
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	response, callErr := g.providers.Probe(ctx, route)
+	latency := time.Since(started).Milliseconds()
+	statusCode := 0
+	message := ""
+	valid := false
+	if response != nil {
+		statusCode = response.StatusCode
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
+		_ = response.Body.Close()
+	}
+	switch {
+	case callErr != nil:
+		message = "Provider could not be reached: " + callErr.Error()
+	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
+		message = "Provider rejected the configured credential."
+	case statusCode >= 200 && statusCode < 400:
+		valid = true
+	case statusCode > 0:
+		message = fmt.Sprintf("Provider returned HTTP %d.", statusCode)
+	}
+	validationStatus := "temporarily_unavailable"
+	if valid {
+		validationStatus = "valid"
+	} else if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
+		validationStatus = "invalid"
+	}
+	_ = g.store.SetProviderValidation(r.Context(), providerID, validationStatus, message)
+	_ = g.store.RecordRouteOutcome(r.Context(), store.RouteOutcome{ModelID: route.Model.ID, ProviderID: providerID, Success: valid, Status: statusCode, LatencyMS: latency, Error: message})
+	_ = g.refreshRuntime(r.Context())
+	writeJSON(w, http.StatusOK, map[string]any{"provider_id": providerID, "valid": valid, "status": validationStatus, "http_status": statusCode, "latency_ms": latency, "message": message})
+}
+
 func (g *Gateway) deleteProvider(w http.ResponseWriter, r *http.Request) {
 	if err := g.store.DeleteConnection(r.Context(), r.PathValue("id")); err != nil {
 		writeError(w, http.StatusBadRequest, "delete_failed", err.Error())
@@ -754,11 +786,7 @@ func (g *Gateway) refreshRuntime(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	rules, err := g.store.RoutingRules(ctx)
-	if err != nil {
-		return err
-	}
-	g.router.Replace(runtimeCatalog, keys, rules)
+	g.router.Replace(runtimeCatalog, keys)
 	return nil
 }
 
@@ -773,16 +801,17 @@ func validateProviderURL(value string, allowInsecure bool) error {
 	return nil
 }
 
-func customEndpointPaths(baseURL, protocol string) (string, string, string) {
+func customEndpointPaths(baseURL, protocol string) (string, string, string, string, string, string, string, string) {
 	parsed, _ := url.Parse(baseURL)
 	prefix := "/v1"
 	if strings.HasSuffix(strings.TrimRight(parsed.Path, "/"), "/v1") {
 		prefix = ""
 	}
 	if protocol == "anthropic" {
-		return prefix + "/messages", "", ""
+		return prefix + "/messages", "", "", "", "", "", "", ""
 	}
-	return prefix + "/chat/completions", prefix + "/responses", prefix + "/embeddings"
+	return prefix + "/chat/completions", prefix + "/responses", prefix + "/embeddings",
+		prefix + "/images/generations", prefix + "/rerank", prefix + "/videos", prefix + "/audio/speech", prefix + "/audio/transcriptions"
 }
 
 func normalizeModelInput(input modelInput, providerID string) (catalog.Model, error) {
@@ -795,8 +824,8 @@ func normalizeModelInput(input modelInput, providerID string) (catalog.Model, er
 	if len(capabilities) == 0 {
 		capabilities = append([]string(nil), defaultModelCapabilities...)
 	} else {
-		allowed := make(map[string]bool, len(defaultModelCapabilities))
-		for _, capability := range defaultModelCapabilities {
+		allowed := make(map[string]bool, len(allowedModelCapabilities))
+		for _, capability := range allowedModelCapabilities {
 			allowed[capability] = true
 		}
 		seen := make(map[string]bool, len(capabilities))
@@ -821,9 +850,19 @@ func normalizeModelInput(input modelInput, providerID string) (catalog.Model, er
 	if err != nil {
 		return catalog.Model{}, err
 	}
+	if input.InputPrice < 0 || input.OutputPrice < 0 {
+		return catalog.Model{}, errors.New("Input and output prices cannot be negative.")
+	}
+	currency := strings.ToUpper(strings.TrimSpace(input.Currency))
+	if currency == "" {
+		currency = "USD"
+	}
+	if currency != "USD" {
+		return catalog.Model{}, errors.New("Only USD pricing is currently supported.")
+	}
 	return catalog.Model{ID: id, Name: name, Family: strings.ToLower(strings.TrimSpace(input.Family)), Provider: providerID,
 		UpstreamModel: upstream, Capabilities: capabilities, ContextWindow: input.ContextWindow,
-		MaxOutputTokens: input.MaxOutputTokens, Pricing: catalog.Pricing{Currency: "USD"}, Priority: priority, Weight: weight}, nil
+		MaxOutputTokens: input.MaxOutputTokens, Pricing: catalog.Pricing{InputPerMillion: input.InputPrice, OutputPerMillion: input.OutputPrice, Currency: currency}, Priority: priority, Weight: weight}, nil
 }
 
 func normalizeRoutePolicy(priority, weight int) (int, int, error) {
@@ -844,7 +883,14 @@ func normalizeRoutePolicy(priority, weight int) (int, int, error) {
 
 func (g *Gateway) adminUsage(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	recent, err := g.store.Recent(r.Context(), limit)
+	if limit < 1 || limit > 500 {
+		limit = 100
+	}
+	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	if offset < 0 {
+		offset = 0
+	}
+	recent, err := g.store.RecentPage(r.Context(), limit, offset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database_error", err.Error())
 		return
@@ -854,7 +900,7 @@ func (g *Gateway) adminUsage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "database_error", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"summary": summary, "recent": recent})
+	writeJSON(w, http.StatusOK, map[string]any{"summary": summary, "recent": recent, "pagination": map[string]any{"limit": limit, "offset": offset, "total": summary.Requests}})
 }
 
 type apiUserInput struct {

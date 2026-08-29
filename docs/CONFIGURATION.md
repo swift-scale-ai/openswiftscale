@@ -15,6 +15,7 @@ Provider credentials are not required at startup. Configure them later in the em
 | --- | --- | --- |
 | `OPENSWIFTSCALE_ADMIN_USERNAME` | `admin` | Administrator console username. |
 | `OPENSWIFTSCALE_LISTEN_ADDR` | `:8080` | HTTP listen address. |
+| `OPENSWIFTSCALE_LAN_LISTEN_ADDR` | empty | Optional second listener using one explicit LAN IP and port, for example `192.168.1.25:8080`. Unspecified addresses such as `0.0.0.0` are rejected. |
 | `OPENSWIFTSCALE_PUBLIC_URL` | empty | Client-reachable gateway origin shown in the console, for example `http://192.168.1.25:8080` or an internal HTTPS URL. |
 | `OPENSWIFTSCALE_DATABASE_PATH` | `/data/openswiftscale.db` | SQLite path. |
 | `OPENSWIFTSCALE_MASTER_KEY_PATH` | `/data/keys/master.key` | Master key stored separately from SQLite. Generated with mode `0600` on first start. |
@@ -27,7 +28,7 @@ Provider credentials are not required at startup. Configure them later in the em
 | `OPENSWIFTSCALE_AUTH_DISABLED` | `false` | Explicit local-only authentication bypass. |
 | `OPENSWIFTSCALE_LOG_PROMPTS` | `false` | Reserved opt-in. Prompt persistence is not implemented. |
 
-The console uses HTTP Basic authentication for its management API. `scripts/install.sh` generates a random production password in `secrets/admin_password.txt`; `scripts/dev.sh` uses `admin` / `openswiftscale` for local development. Existing installations may temporarily continue using `OPENSWIFTSCALE_MANAGEMENT_TOKEN` as the administrator password while migrating.
+The console uses HTTP Basic authentication for its management API. The default local development login used by `scripts/dev.sh` is username `admin` and password `openswiftscale`. `scripts/install.sh` generates a random production password in `secrets/admin_password.txt` instead. Existing installations may temporarily continue using `OPENSWIFTSCALE_MANAGEMENT_TOKEN` as the administrator password while migrating.
 
 ## Client API keys
 
@@ -62,7 +63,7 @@ Provider secrets are encrypted with AES-256-GCM using per-secret random nonces a
 2. Its capability includes the requested endpoint.
 3. Its provider connection is enabled and has a configured key.
 
-The top-level `families` list is discovery metadata for the console's publisher → family hierarchy. Each family references its official `provider`, so the console can show the publisher-operated endpoint even before an exact model ID is configured. A family with `routeable: false` is publicly offered by its publisher but uses a dedicated image, video, speech, music, or moderation protocol that this gateway does not yet implement. It remains visible for catalog completeness, but it is never advertised by `/v1/models` and cannot receive traffic until an exact model route and protocol adapter exist.
+The top-level `families` list is discovery metadata for the console's publisher → family hierarchy. Each family references its official `provider`, so the console can show the publisher-operated endpoint even before an exact model ID is configured. The gateway exposes unified text, image, embeddings, rerank, video, speech, and transcription entry points. A family with `routeable: false` still requires a provider-specific protocol or resource endpoint (for example music or moderation). It remains visible for catalog completeness, but it is never advertised by `/v1/models` and cannot receive traffic until an exact model route and compatible adapter exist.
 
 ## Same-model endpoint routing
 
@@ -75,19 +76,15 @@ Multiple connections can publish the same exact **model ID**. The main workspace
 
 The exact model ID is the aggregation key. To attach a third-party endpoint, configure it with the same model ID; its provider-specific upstream identifier may differ. Endpoint routing must never substitute a different model ID.
 
-The simplified console does not expose failover, load-balancing, hybrid, or virtual-alias terminology. Use **Route settings** beside the selected exact model ID to enable or exclude endpoints, drag them into fallback order, and set their initial traffic weights. In manual mode, weights select the first endpoint and the dragged order determines subsequent attempts after a retryable failure. Enabling **Use platform default strategy** restores equal default priority and weight while preserving the selected participating endpoints.
+Use **Route settings** beside the selected exact model ID to enable or exclude endpoints and select one explicit routing mode. **Sequential failover** uses the dragged top-to-bottom order and sends normal traffic to the first endpoint; the next endpoint is attempted only after a retryable failure. **Weighted traffic distribution** places all participating endpoints in one routing group and uses their relative weights for the initial request choice—for example, `70 / 30` targets approximately 70% / 30% over time. If the selected endpoint fails, the remaining endpoint is still attempted within the same request. Order and weight are intentionally not active at the same time.
 
-For example, two routes with priority `10` and weights `80` and `20` receive approximately 80% and 20% of new requests. A third route with priority `20` normally receives no initial traffic; it becomes the next failover target after priority-10 routes fail.
+Enabling **Use platform default strategy** transparently ranks participating endpoints using price (45%), observed request availability (35%), latency EWMA (15%), and the selected regional preference (5%). With no observations, an endpoint starts with a neutral availability prior and a 500 ms latency prior. A zero price is treated as unknown—not free—and receives a conservative neutral price score. The score, availability, and observed latency are returned by the management API and displayed in the console; the selected model ID never changes. **Global** is region-neutral, while Asia Pacific, United States, Europe, and Local give matching endpoints a small advantage without preventing cross-region failover.
 
 Automatic failover advances on connection and timeout errors and on upstream HTTP `401`, `403`, `408`, `429`, and `5xx` responses. Other client errors are returned directly because retrying the same invalid request against another provider can hide a request problem. The gateway does not persist or replay prompts beyond the current HTTP request.
 
 Successful inference responses include `X-OpenSwiftScale-Provider` and `X-OpenSwiftScale-Route-Priority`, and request records identify the provider that ultimately served each request.
 
-## Deprecated cross-model configuration
-
-Older builds exposed virtual model aliases and model fallback chains. They are no longer part of the product interface because they can replace the model explicitly selected by a developer. Existing database records and compatibility APIs are retained during the interface transition and will be addressed by a separate data migration.
-
-Price fields are local estimates, not provider invoices. Verify prices and model limits before production deployment.
+Third-party endpoint input and output prices are configured in USD per one million tokens and feed both cost estimates and the default score. Price fields are local estimates, not provider invoices. Verify prices and model limits before production deployment.
 
 ## Persistence and backups
 

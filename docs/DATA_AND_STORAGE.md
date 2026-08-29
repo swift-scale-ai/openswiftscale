@@ -1,6 +1,6 @@
 # Data and storage
 
-OpenSwiftScale Community uses SQLite as its runtime source of truth. It does not require PostgreSQL, Redis, or a hosted SwiftScale account.
+The OpenSwiftScale self-hosted runtime uses SQLite as its source of truth. It does not require PostgreSQL, Redis, or a hosted account.
 
 ## Database locations
 
@@ -17,7 +17,7 @@ SQLite WAL mode is enabled. A running database may therefore have `-wal` and `-s
 - Official and third-party provider connections.
 - Public model definitions and provider-specific upstream model IDs.
 - Endpoint priority, weight, capability, and enabled state.
-- Endpoint-order compatibility records and deprecated virtual-alias records from earlier builds.
+- Per-model routing mode, endpoint participation, priority, weight, and regional preference.
 - Internal API-key ownership records and key enabled state.
 - Managed Gateway API-key labels, prefixes, SHA-256 hashes, creation time, and last-used time.
 - Request metadata including request ID, model, serving provider, status, token counts, latency, and local estimated cost.

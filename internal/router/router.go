@@ -18,48 +18,28 @@ var (
 )
 
 type Route struct {
-	Model        catalog.Model
-	Provider     catalog.Provider
-	APIKey       string
-	RuleID       string
-	RulePriority int
-	RuleWeight   int
+	Model    catalog.Model
+	Provider catalog.Provider
+	APIKey   string
 }
 
 type Router struct {
 	mu      sync.RWMutex
 	catalog *catalog.Catalog
 	keys    map[string]string
-	rules   map[string]catalog.RoutingRule
 	cursors sync.Map
 }
 
-func New(c *catalog.Catalog, keys map[string]string, routingRules ...[]catalog.RoutingRule) *Router {
-	r := &Router{catalog: c, keys: keys}
-	if len(routingRules) > 0 {
-		r.setRules(routingRules[0])
-	}
-	return r
+func New(c *catalog.Catalog, keys map[string]string) *Router {
+	return &Router{catalog: c, keys: keys}
 }
 
-func (r *Router) Replace(c *catalog.Catalog, keys map[string]string, routingRules ...[]catalog.RoutingRule) {
+func (r *Router) Replace(c *catalog.Catalog, keys map[string]string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.catalog = c
 	r.keys = keys
-	if len(routingRules) > 0 {
-		r.setRules(routingRules[0])
-	}
 	r.cursors = sync.Map{}
-}
-
-func (r *Router) setRules(rules []catalog.RoutingRule) {
-	r.rules = make(map[string]catalog.RoutingRule, len(rules))
-	for _, rule := range rules {
-		if rule.Enabled {
-			r.rules[strings.ToLower(strings.TrimSpace(rule.ID))] = rule
-		}
-	}
 }
 
 func (r *Router) Catalog() *catalog.Catalog {
@@ -73,15 +53,11 @@ func (r *Router) Resolve(modelID, capability string) ([]Route, error) {
 	defer r.mu.RUnlock()
 	models := r.catalog.ModelsByID(modelID)
 	if len(models) == 0 {
-		rule, ok := r.rules[strings.ToLower(strings.TrimSpace(modelID))]
-		if !ok {
-			return nil, ErrModelNotFound
-		}
-		return r.resolveRule(rule, capability)
+		return nil, ErrModelNotFound
 	}
 	hasCapability := false
 	for _, model := range models {
-		hasCapability = hasCapability || catalog.HasCapability(model, capability)
+		hasCapability = hasCapability || supportsEndpoint(model, capability)
 	}
 	if !hasCapability {
 		return nil, ErrCapabilityMismatch
@@ -107,82 +83,11 @@ func (r *Router) Resolve(modelID, capability string) ([]Route, error) {
 	return routes, nil
 }
 
-func (r *Router) resolveRule(rule catalog.RoutingRule, capability string) ([]Route, error) {
-	byPriority := make(map[int][]catalog.RoutingRuleMember)
-	memberRoutes := make(map[string][]Route)
-	priorities := make([]int, 0)
-	hasCapability := false
-	for _, member := range rule.Members {
-		memberHasCapability := false
-		for _, model := range r.catalog.ModelsByID(member.ModelID) {
-			memberHasCapability = memberHasCapability || catalog.HasCapability(model, capability)
-		}
-		hasCapability = hasCapability || memberHasCapability
-		if !memberHasCapability {
-			continue
-		}
-		resolved := r.routesForModel(member.ModelID, capability)
-		if len(resolved) == 0 {
-			continue
-		}
-		for index := range resolved {
-			resolved[index].RuleID = rule.ID
-			resolved[index].RulePriority = member.Priority
-			resolved[index].RuleWeight = member.Weight
-		}
-		memberRoutes[member.ModelID] = resolved
-		if _, exists := byPriority[member.Priority]; !exists {
-			priorities = append(priorities, member.Priority)
-		}
-		byPriority[member.Priority] = append(byPriority[member.Priority], member)
-	}
-	if !hasCapability {
-		return nil, ErrCapabilityMismatch
-	}
-	sort.Ints(priorities)
-	var routes []Route
-	for _, priority := range priorities {
-		members := byPriority[priority]
-		sort.Slice(members, func(i, j int) bool { return members[i].ModelID < members[j].ModelID })
-		selected := r.weightedMemberIndex(rule.ID, priority, members)
-		for offset := range members {
-			member := members[(selected+offset)%len(members)]
-			routes = append(routes, memberRoutes[member.ModelID]...)
-		}
-	}
-	if len(routes) == 0 {
-		return nil, ErrModelUnavailable
-	}
-	return deduplicateRoutes(routes), nil
-}
-
-func (r *Router) weightedMemberIndex(ruleID string, priority int, members []catalog.RoutingRuleMember) int {
-	if len(members) < 2 {
-		return 0
-	}
-	total := uint64(0)
-	for _, member := range members {
-		total += uint64(member.Weight)
-	}
-	if total == 0 {
-		return 0
-	}
-	position := r.nextPosition("rule:"+ruleID, priority, total)
-	for index, member := range members {
-		weight := uint64(member.Weight)
-		if position < weight {
-			return index
-		}
-		position -= weight
-	}
-	return 0
-}
-
 func (r *Router) routesForModel(modelID, capability string) []Route {
 	byPriority := make(map[int][]Route)
 	priorities := make([]int, 0)
 	for _, candidate := range r.catalog.ModelsByID(modelID) {
-		if !catalog.HasCapability(candidate, capability) {
+		if !supportsEndpoint(candidate, capability) {
 			continue
 		}
 		provider, ok := r.catalog.ProviderByID(candidate.Provider)
@@ -191,8 +96,15 @@ func (r *Router) routesForModel(modelID, capability string) []Route {
 			continue
 		}
 		priority := candidate.Priority
-		if candidate.ManualRouting {
+		if candidate.RoutingMode == "weighted" {
 			priority = 100
+		} else if (candidate.RoutingMode == "platform" || candidate.RoutingMode == "") && candidate.PlatformScore > 0 {
+			// Higher platform scores are attempted first. Convert the public
+			// 0-100 score to the router's lower-is-better priority scale.
+			priority = int((100-candidate.PlatformScore)*100) + 1
+			candidate.Priority = priority
+			candidate.RouteOrder = priority
+			candidate.Weight = 100
 		}
 		if _, exists := byPriority[priority]; !exists {
 			priorities = append(priorities, priority)
@@ -215,6 +127,22 @@ func (r *Router) routesForModel(modelID, capability string) []Route {
 		}
 	}
 	return ordered
+}
+
+func supportsEndpoint(model catalog.Model, endpoint string) bool {
+	if catalog.HasCapability(model, endpoint) {
+		return true
+	}
+	switch endpoint {
+	case "rerank":
+		return catalog.HasCapability(model, "retrieval")
+	case "transcription":
+		return catalog.HasCapability(model, "asr")
+	case "speech":
+		return catalog.HasCapability(model, "tts")
+	default:
+		return false
+	}
 }
 
 func (r *Router) weightedIndex(modelID string, priority int, routes []Route) int {
@@ -247,19 +175,6 @@ func (r *Router) nextPosition(key string, priority int, total uint64) uint64 {
 	return position % total
 }
 
-func deduplicateRoutes(routes []Route) []Route {
-	seen := make(map[string]bool)
-	out := make([]Route, 0, len(routes))
-	for _, route := range routes {
-		key := route.Model.ID + "\x00" + route.Provider.ID
-		if !seen[key] {
-			seen[key] = true
-			out = append(out, route)
-		}
-	}
-	return out
-}
-
 func (r *Router) Available(model catalog.Model) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -277,21 +192,24 @@ func (r *Router) ModelAvailable(modelID string) bool {
 	return false
 }
 
-func (r *Router) RuleAvailable(ruleID string) bool {
+func (r *Router) RouteForProvider(providerID string) (Route, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	rule, ok := r.rules[strings.ToLower(strings.TrimSpace(ruleID))]
+	providerID = strings.ToLower(strings.TrimSpace(providerID))
+	provider, ok := r.catalog.ProviderByID(providerID)
 	if !ok {
-		return false
+		return Route{}, false
 	}
-	for _, member := range rule.Members {
-		for _, model := range r.catalog.ModelsByID(member.ModelID) {
-			if strings.TrimSpace(r.keys[model.Provider]) != "" {
-				return true
-			}
+	key := strings.TrimSpace(r.keys[providerID])
+	if key == "" {
+		return Route{}, false
+	}
+	for _, model := range r.catalog.Models {
+		if model.Provider == providerID {
+			return Route{Model: model, Provider: provider, APIKey: key}, true
 		}
 	}
-	return false
+	return Route{}, false
 }
 
 func cloneCatalog(source *catalog.Catalog) *catalog.Catalog {

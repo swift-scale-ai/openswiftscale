@@ -51,15 +51,15 @@ CREATE TABLE IF NOT EXISTS model_route_preferences (
 );
 
 INSERT INTO provider_connections
-(id,name,type,base_url,chat_path,responses_path,embeddings_path,authentication,api_key_header,official,model_category,enabled,validation_status,created_at,updated_at)
+(id,name,type,base_url,chat_path,responses_path,embeddings_path,authentication,api_key_header,region,official,model_category,enabled,validation_status,created_at,updated_at)
 VALUES
-('demo-qwen-sg','Demo ModelHub Singapore','openai-compatible','https://qwen-sg.demo.invalid/v1','/chat/completions','/responses','/embeddings','bearer','Authorization',0,'open-source',1,'unverified',strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-('demo-qwen-us','Demo Inference US','openai-compatible','https://qwen-us.demo.invalid/openai/v1','/chat/completions','/responses','/embeddings','bearer','Authorization',0,'open-source',1,'unverified',strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-('demo-qwen-tokyo','Demo GPU Backup Tokyo','openai-compatible','https://qwen-tokyo.demo.invalid/v1','/chat/completions','/responses','/embeddings','bearer','Authorization',0,'open-source',1,'unverified',strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+('demo-qwen-sg','Demo ModelHub Singapore','openai-compatible','https://qwen-sg.demo.invalid/v1','/chat/completions','/responses','/embeddings','bearer','Authorization','apac',0,'open-source',1,'unverified',strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+('demo-qwen-us','Demo Inference US','openai-compatible','https://qwen-us.demo.invalid/openai/v1','/chat/completions','/responses','/embeddings','bearer','Authorization','us',0,'open-source',1,'unverified',strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+('demo-qwen-tokyo','Demo GPU Backup Tokyo','openai-compatible','https://qwen-tokyo.demo.invalid/v1','/chat/completions','/responses','/embeddings','bearer','Authorization','apac',0,'open-source',1,'unverified',strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 ON CONFLICT(id) DO UPDATE SET name=excluded.name,type=excluded.type,base_url=excluded.base_url,
 chat_path=excluded.chat_path,responses_path=excluded.responses_path,embeddings_path=excluded.embeddings_path,
 authentication=excluded.authentication,api_key_header=excluded.api_key_header,model_category=excluded.model_category,
-enabled=excluded.enabled,updated_at=excluded.updated_at;
+region=excluded.region,enabled=excluded.enabled,updated_at=excluded.updated_at;
 
 UPDATE model_routes SET priority=10,weight=70,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE model_id='qwen3.8-max' AND provider_id='qwen';
 UPDATE model_routes SET priority=10,weight=60,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE model_id='qwen3.7-plus' AND provider_id='qwen';

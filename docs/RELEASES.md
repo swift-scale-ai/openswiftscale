@@ -1,6 +1,6 @@
 # Releases
 
-OpenSwiftScale uses tagged GitHub releases for reproducible Community distribution. A tag matching `v*` starts the release workflow.
+OpenSwiftScale uses tagged GitHub releases for reproducible open-source distribution. A tag matching `v*` starts the release workflow.
 
 ## Release outputs
 

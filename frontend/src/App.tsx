@@ -31,7 +31,7 @@ import {
 } from "lucide-react";
 import { localeOptions, useI18n, type Locale, type MessageKey } from "./i18n";
 
-type ViewID = "models" | "access" | "usage" | "health";
+type ViewID = "models" | "access" | "usage";
 type RouteStrategy = "failover" | "load-balance" | "hybrid";
 
 interface GatewayStatus {
@@ -45,6 +45,8 @@ interface GatewayStatus {
   telemetry: boolean;
   prompt_logging: boolean;
   api_base_url: string;
+  local_api_base_url?: string;
+  lan_api_base_url?: string;
 }
 
 interface Model {
@@ -58,6 +60,12 @@ interface Model {
   weight: number;
   route_order?: number;
   available: boolean;
+  success_count?: number;
+  failure_count?: number;
+  latency_ewma_ms?: number;
+  last_status?: number;
+  last_checked_at?: string;
+  platform_score?: number;
   pricing?: {
     input_per_million: number;
     output_per_million: number;
@@ -81,6 +89,7 @@ interface Provider {
   name: string;
   type: string;
   base_url: string;
+  region: string;
   authentication: string;
   api_key_header: string;
   allow_insecure_http: boolean;
@@ -88,6 +97,9 @@ interface Provider {
   model_category?: "open-source" | "commercial" | "";
   enabled: boolean;
   has_api_key: boolean;
+  validation_status?: "unverified" | "valid" | "invalid" | "temporarily_unavailable";
+  last_validated_at?: string;
+  last_error?: string;
   models: Model[];
 }
 
@@ -121,11 +133,21 @@ interface ModelRouteEndpointSetting {
   weight: number;
   input_price: number;
   output_price: number;
+  region: string;
+  success_count: number;
+  failure_count: number;
+  latency_ewma_ms: number;
+  last_status: number;
+  last_checked_at?: string;
+  availability: number;
+  platform_score: number;
 }
 
 interface ModelRouteSettingsPayload {
   model_id: string;
   use_platform_default: boolean;
+  routing_mode: "platform" | "failover" | "weighted";
+  preferred_region: string;
   endpoints: ModelRouteEndpointSetting[];
 }
 
@@ -149,6 +171,11 @@ interface UsagePayload {
     cost_usd: number;
   };
   recent: UsageItem[];
+  pagination?: {
+    limit: number;
+    offset: number;
+    total: number;
+  };
 }
 
 interface OperationalState {
@@ -183,16 +210,14 @@ interface AdminCredentials {
 
 const viewMeta: Record<ViewID, { eyebrow: MessageKey; title: MessageKey; description: MessageKey }> = {
   models: { eyebrow: "transparentGateway", title: "modelWorkspace", description: "modelWorkspaceHelp" },
-  access: { eyebrow: "apiAccess", title: "apiUsers", description: "metaAccess" },
-  usage: { eyebrow: "localObservability", title: "usage", description: "metaUsage" },
-  health: { eyebrow: "operations", title: "health", description: "metaHealth" }
+  access: { eyebrow: "apiAccess", title: "apiAccess", description: "metaAccess" },
+  usage: { eyebrow: "localObservability", title: "runtimeMonitoring", description: "runtimeMonitoringHelp" }
 };
 
 const topNavigation: Array<{ id: ViewID; label: MessageKey; icon: LucideIcon }> = [
   { id: "models", label: "modelsAndEndpoints", icon: Boxes },
-  { id: "access", label: "apiKeys", icon: KeyRound },
-  { id: "usage", label: "recentRequests", icon: BarChart3 },
-  { id: "health", label: "health", icon: Activity }
+  { id: "access", label: "apiAccess", icon: KeyRound },
+  { id: "usage", label: "runtimeMonitoring", icon: Activity }
 ];
 
 const capabilityOptions = [
@@ -203,8 +228,29 @@ const capabilityOptions = [
   { value: "reasoning", label: "capReasoning" },
   { value: "structured_output", label: "capStructured" },
   { value: "vision", label: "capVision" },
-  { value: "embeddings", label: "capEmbeddings" }
+  { value: "embeddings", label: "capEmbeddings" },
+  { value: "image", label: "tagImage" },
+  { value: "rerank", label: "tagRerank" },
+  { value: "video", label: "tagVideo" },
+  { value: "speech", label: "tagSpeech" },
+  { value: "transcription", label: "tagTranscription" }
 ] as const;
+
+const publicInferenceEndpoints = [
+  "GET /models",
+  "POST /chat/completions",
+  "POST /responses",
+  "POST /embeddings",
+  "POST /images/generations",
+  "POST /rerank",
+  "POST /videos",
+  "POST /audio/speech",
+  "POST /audio/transcriptions"
+] as const;
+
+function PublicInferenceEndpoints() {
+  return <>{publicInferenceEndpoints.map((endpoint) => <code key={endpoint}>{endpoint}</code>)}</>;
+}
 
 const familyCapabilityMessageKeys: Record<string, MessageKey> = {
   text: "familyTypeText", image: "familyTypeImage", video: "familyTypeVideo", audio: "familyTypeAudio",
@@ -245,10 +291,17 @@ const modelFamilyLabels: Record<string, string> = {
 };
 
 const openSourceModelFamilies = new Set(["deepseek", "glm", "hy", "mimo", "minimax", "nemotron", "qwen", "llama", "mistral"]);
+const openSourceModelPublishers = new Set(["Alibaba", "DeepSeek", "Meta", "MiniMax", "Mistral AI", "Moonshot AI", "NVIDIA", "StepFun", "Tencent", "Xiaomi", "Z.AI"]);
 const modelFamiliesByCategory: Record<"open-source" | "commercial", string[]> = {
   "open-source": ["deepseek", "qwen", "glm", "minimax", "hy", "mimo", "nemotron", "llama", "mistral", "generic"],
   commercial: ["gpt", "claude", "gemini", "grok", "muse-spark", "muse-image", "generic"]
 };
+
+function modelFamilyMatchesCategory(family: ModelFamily, category: "open-source" | "commercial"): boolean {
+  if (family.id === "generic") return true;
+  const isOpenSourcePublisher = family.publisher ? openSourceModelPublishers.has(family.publisher) : openSourceModelFamilies.has(family.id);
+  return category === "open-source" ? isOpenSourcePublisher : !isOpenSourcePublisher;
+}
 
 function modelBrandKey(model: Model): string {
   if (["happyhorse", "qwen-image", "wan", "muse-spark", "muse-image"].includes(model.family)) return model.family;
@@ -289,6 +342,7 @@ function fallbackAPIBaseURL(): string {
 function initialView(): ViewID {
   const value = window.location.hash.slice(1);
   if (value === "overview" || value === "connections") return "models";
+  if (value === "health") return "usage";
   return value in viewMeta ? value as ViewID : "models";
 }
 
@@ -338,20 +392,16 @@ export function App() {
     username: sessionStorage.getItem("openswiftscale_admin_username") || "admin",
     password: sessionStorage.getItem("openswiftscale_admin_password") || sessionStorage.getItem("openswiftscale_management_token") || ""
   }));
-  const [showAuth, setShowAuth] = useState(() => !sessionStorage.getItem("openswiftscale_admin_password") && !sessionStorage.getItem("openswiftscale_management_token"));
   const [connected, setConnected] = useState(false);
   const [connectionError, setConnectionError] = useState("");
   const [status, setStatus] = useState<GatewayStatus | null>(null);
   const [models, setModels] = useState<Model[]>([]);
   const [modelFamilies, setModelFamilies] = useState<ModelFamily[]>([]);
   const [providers, setProviders] = useState<Provider[]>([]);
-  const [routingRules, setRoutingRules] = useState<RoutingRule[]>([]);
-  const [modelRoutePolicies, setModelRoutePolicies] = useState<ModelRoutePolicy[]>([]);
   const [usage, setUsage] = useState<UsagePayload | null>(null);
+  const [usagePage, setUsagePage] = useState(1);
   const [apiUsers, setAPIUsers] = useState<APIUserRecord[]>([]);
   const [editingProvider, setEditingProvider] = useState<Provider | null | undefined>(undefined);
-  const [editingRule, setEditingRule] = useState<RoutingRule | null | undefined>(undefined);
-  const [routeWizardModelID, setRouteWizardModelID] = useState<string | null | undefined>(undefined);
   const [routeSettingsModelID, setRouteSettingsModelID] = useState<string | undefined>(undefined);
   const [operational, setOperational] = useState<OperationalState>({ service: "checking", database: "checking" });
 
@@ -372,32 +422,34 @@ export function App() {
   const load = useCallback(async () => {
     if (!credentials.username || !credentials.password) return;
     try {
-      const [statusPayload, modelPayload, modelFamilyPayload, usagePayload, providerPayload, rulePayload, modelRoutePolicyPayload, apiUserPayload] = await Promise.all([
+      const [statusPayload, modelPayload, modelFamilyPayload, usagePayload, providerPayload, apiUserPayload] = await Promise.all([
         api<GatewayStatus>("/api/admin/status", credentials),
         api<Model[]>("/api/admin/models", credentials),
         api<ModelFamily[]>("/api/admin/model-families", credentials),
-        api<UsagePayload>("/api/admin/usage?limit=50", credentials),
+        api<UsagePayload>("/api/admin/usage?limit=20&offset=0", credentials),
         api<Provider[]>("/api/admin/providers", credentials),
-        api<RoutingRule[]>("/api/admin/routing-rules", credentials),
-        api<ModelRoutePolicy[]>("/api/admin/model-route-policies", credentials),
         api<APIUserRecord[]>("/api/admin/users", credentials)
       ]);
       setStatus(statusPayload);
       setModels(modelPayload);
       setModelFamilies(modelFamilyPayload || []);
       setUsage(usagePayload);
+      setUsagePage(1);
       setProviders(providerPayload);
-      setRoutingRules(rulePayload || []);
-      setModelRoutePolicies(modelRoutePolicyPayload || []);
       setAPIUsers(apiUserPayload || []);
       setConnected(true);
-      setShowAuth(false);
       setConnectionError("");
     } catch (cause) {
       setConnected(false);
-      setShowAuth(true);
       setConnectionError(cause instanceof Error ? cause.message : String(cause));
     }
+  }, [credentials]);
+
+  const loadUsagePage = useCallback(async (page: number) => {
+    const safePage = Math.max(1, page);
+    const payload = await api<UsagePayload>(`/api/admin/usage?limit=20&offset=${(safePage - 1) * 20}`, credentials);
+    setUsage(payload);
+    setUsagePage(safePage);
   }, [credentials]);
 
   useEffect(() => { void load(); }, [load]);
@@ -437,15 +489,12 @@ export function App() {
     setStatus(null);
     setModels([]);
     setProviders([]);
-    setRoutingRules([]);
-    setModelRoutePolicies([]);
     setUsage(null);
     setAPIUsers([]);
-    setShowAuth(true);
   };
 
   const removeProvider = async (provider: Provider) => {
-    if (!window.confirm(`Delete custom connection “${provider.id}” and its models?`)) return;
+    if (!window.confirm(`${t("delete")} ${t("connectionId")} “${provider.id}”?`)) return;
     try {
       await api<null>(`/api/admin/providers/${encodeURIComponent(provider.id)}`, credentials, { method: "DELETE" });
       await load();
@@ -455,7 +504,7 @@ export function App() {
   };
 
   const removeRoutingRule = async (rule: RoutingRule) => {
-    if (!window.confirm(`Delete routing rule “${rule.id}”?`)) return;
+    if (!window.confirm(`${t("delete")} “${rule.id}”?`)) return;
     try {
       await api<null>(`/api/admin/routing-rules/${encodeURIComponent(rule.id)}`, credentials, { method: "DELETE" });
       await load();
@@ -465,7 +514,7 @@ export function App() {
   };
 
   const removeModelRoutePolicy = async (policy: ModelRoutePolicy) => {
-    if (!window.confirm(`Delete model route rule “${policy.model_id}”? Provider connections and model endpoints will be preserved.`)) return;
+    if (!window.confirm(`${t("delete")} “${policy.model_id}”?`)) return;
     try {
       await api<null>(`/api/admin/model-route-policies/${encodeURIComponent(policy.model_id)}`, credentials, { method: "DELETE" });
       await load();
@@ -476,60 +525,108 @@ export function App() {
 
   const meta = viewMeta[view];
 
+  if (!connected) {
+    return <div className="auth-page">
+      <header className="auth-page-header">
+        <div className="brand simple-brand" aria-label="OpenSwiftScale">
+          <img src="/openswiftscale-logo.svg" alt="" />
+          <span className="brand-copy"><span className="brand-title">OpenSwiftScale</span><span className="brand-subtitle">{t("transparentGateway")}</span></span>
+        </div>
+        <label className="language-select"><span>{t("language")}</span><select value={locale} onChange={(event) => setLocale(event.target.value as Locale)} aria-label={t("language")}>{localeOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+      </header>
+      <main className="auth-page-main">
+        <section className="auth-dialog auth-page-card" aria-labelledby="auth-dialog-title" aria-describedby="auth-dialog-description">
+          <div className="auth-dialog-header">
+            <div className="auth-copy">
+              <span className="auth-icon"><LockKeyhole aria-hidden="true" /></span>
+              <div><p className="section-eyebrow">OpenSwiftScale Console</p><h1 id="auth-dialog-title">{t("adminSignIn")}</h1></div>
+            </div>
+          </div>
+          <p id="auth-dialog-description" className="auth-description">{t("signInHelp")}</p>
+          <form onSubmit={connect}>
+            <label className="auth-field" htmlFor="username"><span>{t("username")}</span><input id="username" name="username" type="text" autoComplete="username" required defaultValue={credentials.username} /></label>
+            <label className="auth-field" htmlFor="password"><span>{t("password")}</span><input id="password" name="password" type="password" autoComplete="current-password" required autoFocus defaultValue={credentials.password} /></label>
+            {connectionError && <p className="form-error compact-error" role="alert">{connectionError}</p>}
+            <button className="admin-action">{t("signIn")}</button>
+          </form>
+          <p className="auth-security"><LockKeyhole aria-hidden="true" /> {t("credentialsTab")}</p>
+        </section>
+      </main>
+      <footer className="site-footer auth-page-footer">
+        <span>© {new Date().getFullYear()} OpenSwiftScale</span>
+        <a href="mailto:contact@openswiftscale.com">contact@openswiftscale.com</a>
+      </footer>
+    </div>;
+  }
+
   return <>
     <div className="admin-shell simple-shell">
       <main className="admin-main">
         <header className="admin-topbar">
           <button className="brand brand-button simple-brand" type="button" onClick={() => selectView("models")} aria-label="OpenSwiftScale"><img src="/openswiftscale-logo.svg" alt="" /><span className="brand-copy"><span className="brand-title">OpenSwiftScale</span><span className="brand-subtitle">{t("transparentGateway")}</span></span></button>
-          <nav className="top-navigation" aria-label="Console navigation">{topNavigation.map((item) => <button key={item.id} className={view === item.id ? "is-active" : ""} type="button" onClick={() => selectView(item.id)}><item.icon aria-hidden="true" /><span>{t(item.label)}</span></button>)}</nav>
-          <div className="admin-topbar-actions"><span className="local-chip"><i className={connected ? "" : "offline"} />{t(connected ? "online" : "notConnected")}</span><label className="language-select"><span>{t("language")}</span><select value={locale} onChange={(event) => setLocale(event.target.value as Locale)} aria-label={t("language")}>{localeOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label><button className="admin-action" type="button" onClick={connected ? signOut : () => setShowAuth(true)}>{t(connected ? "signOut" : "signIn")}</button></div>
+          <nav className="top-navigation" aria-label={t("modelsAndEndpoints")}>
+            {topNavigation.map((item) => <button key={item.id} className={view === item.id ? "is-active" : ""} type="button" onClick={() => selectView(item.id)}><item.icon aria-hidden="true" /><span>{t(item.label)}</span></button>)}
+            <a href="https://github.com/swift-scale-ai/openswiftscale/blob/main/docs/README.md" target="_blank" rel="noreferrer"><BookOpen aria-hidden="true" /><span>{t("documentation")}</span></a>
+          </nav>
+          <div className="admin-topbar-actions"><span className="local-chip"><i />{t("online")}</span><label className="language-select"><span>{t("language")}</span><select value={locale} onChange={(event) => setLocale(event.target.value as Locale)} aria-label={t("language")}>{localeOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label><button className="admin-action" type="button" onClick={signOut}>{t("signOut")}</button></div>
         </header>
-        <section className={`page-heading${view === "models" ? " is-compact" : ""}`}><div>{view !== "models" && <p className="admin-eyebrow">{t(meta.eyebrow)}</p>}<h1>{t(meta.title)}</h1><p className="admin-copy">{t(meta.description)}</p></div></section>
+        <section className="page-heading is-compact"><div><h1>{t(meta.title)}</h1><p className="admin-copy">{t(meta.description)}</p></div></section>
 
         {view === "models" && <ModelWorkspace models={models} families={modelFamilies} providers={providers} connected={connected} onAdd={() => setEditingProvider(null)} onEdit={setEditingProvider} onDelete={(provider) => void removeProvider(provider)} onManageRoute={setRouteSettingsModelID} />}
-        {view === "access" && <APIAccess users={apiUsers} credentials={credentials} connected={connected} onRefresh={load} />}
-        {view === "usage" && <Usage usage={usage} onRefresh={() => void load()} />}
-        {view === "health" && <Health operational={operational} status={status} onRefresh={() => void loadOperational()} />}
+        {view === "access" && <APIAccess users={apiUsers} credentials={credentials} connected={connected} status={status} onRefresh={load} />}
+        {view === "usage" && <Monitoring usage={usage} page={usagePage} pageSize={20} operational={operational} status={status} onPageChange={(page) => void loadUsagePage(page)} onRefresh={() => { void Promise.all([loadUsagePage(usagePage), loadOperational()]); }} />}
         <footer className="site-footer">
           <span>© {new Date().getFullYear()} OpenSwiftScale</span>
           <a href="mailto:contact@openswiftscale.com">contact@openswiftscale.com</a>
         </footer>
       </main>
     </div>
-    {showAuth && <div className="dialog-backdrop auth-backdrop" role="presentation" onMouseDown={(event) => { if (connected && event.target === event.currentTarget) setShowAuth(false); }}>
-      <section className="auth-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-dialog-title" aria-describedby="auth-dialog-description">
-        <div className="auth-dialog-header">
-          <div className="auth-copy">
-            <span className="auth-icon"><LockKeyhole aria-hidden="true" /></span>
-            <div><p className="section-eyebrow">OpenSwiftScale Console</p><h2 id="auth-dialog-title">{t("adminSignIn")}</h2></div>
-          </div>
-          {connected && <button type="button" className="icon-button" onClick={() => setShowAuth(false)} aria-label="Close sign in"><X aria-hidden="true" /></button>}
-        </div>
-        <p id="auth-dialog-description" className="auth-description">{t("signInHelp")}</p>
-        <form onSubmit={connect}>
-          <label className="auth-field" htmlFor="username"><span>{t("username")}</span><input id="username" name="username" type="text" autoComplete="username" required defaultValue={credentials.username} /></label>
-          <label className="auth-field" htmlFor="password"><span>{t("password")}</span><input id="password" name="password" type="password" autoComplete="current-password" required autoFocus defaultValue={credentials.password} /></label>
-          {connectionError && <p className="form-error compact-error" role="alert">{connectionError}</p>}
-          <button className="admin-action">{t("signIn")}</button>
-        </form>
-        <p className="auth-security"><LockKeyhole aria-hidden="true" /> {t("credentialsTab")}</p>
-      </section>
-    </div>}
-    {editingProvider !== undefined && <ProviderDialog provider={editingProvider} credentials={credentials} onClose={() => setEditingProvider(undefined)} onSaved={async () => { setEditingProvider(undefined); await load(); }} />}
-    {editingRule !== undefined && <RoutingRuleDialog rule={editingRule} models={models} credentials={credentials} onClose={() => setEditingRule(undefined)} onSaved={async () => { setEditingRule(undefined); await load(); }} />}
-    {routeWizardModelID !== undefined && <ModelRouteWizard initialModelID={routeWizardModelID} models={models} providers={providers} credentials={credentials} onClose={() => setRouteWizardModelID(undefined)} onSaved={async () => { setRouteWizardModelID(undefined); await load(); }} />}
+    {editingProvider !== undefined && <ProviderDialog provider={editingProvider} families={modelFamilies} credentials={credentials} onClose={() => setEditingProvider(undefined)} onSaved={async () => { setEditingProvider(undefined); await load(); }} />}
     {routeSettingsModelID !== undefined && <SimpleRouteSettingsDialog modelID={routeSettingsModelID} credentials={credentials} onClose={() => setRouteSettingsModelID(undefined)} onSaved={async () => { setRouteSettingsModelID(undefined); await load(); }} />}
   </>;
 }
 
 type ExampleLanguage = "curl" | "python" | "go" | "node" | "java" | "rust";
+type ExampleCapability = "text" | "image" | "embeddings" | "rerank" | "video" | "speech" | "transcription";
 
 const exampleLanguages: Array<{ id: ExampleLanguage; label: string }> = [
-  { id: "curl", label: "cURL" }, { id: "python", label: "Python" }, { id: "go", label: "Go" },
-  { id: "node", label: "Node.js" }, { id: "java", label: "Java" }, { id: "rust", label: "Rust" }
+  { id: "curl", label: "cURL" }, { id: "python", label: "Python" }, { id: "go", label: "Golang" },
+  { id: "java", label: "Java" }, { id: "rust", label: "Rust" }, { id: "node", label: "Node.js" }
 ];
 
-function requestExample(language: ExampleLanguage, baseURL: string, modelID: string): string {
+const exampleCapabilities: Array<{ id: ExampleCapability; label: MessageKey }> = [
+  { id: "text", label: "tagText" }, { id: "image", label: "tagImage" },
+  { id: "embeddings", label: "tagEmbeddings" }, { id: "rerank", label: "tagRerank" },
+  { id: "video", label: "tagVideo" }, { id: "speech", label: "tagSpeech" },
+  { id: "transcription", label: "tagTranscription" }
+];
+
+function exampleModelID(capability: ExampleCapability): string {
+  return `your-${capability}-model-id`;
+}
+
+const endpointRegionOptions: Array<{ value: string; label: MessageKey }> = [
+  { value: "global", label: "regionGlobal" },
+  { value: "apac", label: "regionAPAC" },
+  { value: "us", label: "regionUS" },
+  { value: "europe", label: "regionEurope" },
+  { value: "local", label: "regionLocal" }
+];
+
+function normalizeEndpointRegion(region: string | undefined): string {
+  if (region === "ap-southeast-1") return "apac";
+  if (region === "eu-central-1") return "europe";
+  if (region === "us-east-1") return "us";
+  return endpointRegionOptions.some((option) => option.value === region) ? region! : "global";
+}
+
+function endpointRegionLabel(region: string | undefined, t: (key: MessageKey) => string): string {
+  const normalized = normalizeEndpointRegion(region);
+  return t(endpointRegionOptions.find((option) => option.value === normalized)?.label || "regionGlobal");
+}
+
+function requestExample(language: ExampleLanguage, baseURL: string, modelID: string, capability: ExampleCapability = "text"): string {
+  if (capability !== "text") return typedRequestExample(language, baseURL, modelID, capability);
   const endpoint = `${baseURL}/chat/completions`;
   const body = `{"model":"${modelID}","messages":[{"role":"user","content":"Hello"}]}`;
   if (language === "curl") return [
@@ -546,10 +643,43 @@ function requestExample(language: ExampleLanguage, baseURL: string, modelID: str
   return `curl ${endpoint} \\\n+  -H "Authorization: Bearer <gateway-api-key>" \\\n+  -H "Content-Type: application/json" \\\n+  -d '${body}'`;
 }
 
+function typedRequestSpec(capability: Exclude<ExampleCapability, "text" | "transcription">, modelID: string): { path: string; body: Record<string, unknown> } {
+  switch (capability) {
+    case "image": return { path: "images/generations", body: { model: modelID, prompt: "A transparent AI gateway", size: "1024x1024" } };
+    case "embeddings": return { path: "embeddings", body: { model: modelID, input: "OpenSwiftScale keeps routing transparent." } };
+    case "rerank": return { path: "rerank", body: { model: modelID, query: "transparent AI routing", documents: ["OpenSwiftScale routes exact model IDs.", "A generic document."] } };
+    case "video": return { path: "videos", body: { model: modelID, prompt: "Requests flowing through a transparent AI gateway." } };
+    case "speech": return { path: "audio/speech", body: { model: modelID, input: "Hello from OpenSwiftScale.", voice: "default", response_format: "mp3" } };
+  }
+}
+
+function transcriptionRequestExample(language: ExampleLanguage, endpoint: string, modelID: string): string {
+  if (language === "curl") return [`curl ${endpoint} \\`, `  -H "Authorization: Bearer <gateway-api-key>" \\`, `  -F "model=${modelID}" \\`, `  -F "file=@audio.wav"`].join("\n");
+  if (language === "python") return `import requests\n\nwith open("audio.wav", "rb") as audio:\n    response = requests.post(\n        "${endpoint}",\n        headers={"Authorization": "Bearer <gateway-api-key>"},\n        data={"model": "${modelID}"},\n        files={"file": ("audio.wav", audio, "audio/wav")},\n    )\nresponse.raise_for_status()\nprint(response.json())`;
+  if (language === "node") return `import { readFile } from "node:fs/promises";\n\nconst form = new FormData();\nform.append("model", "${modelID}");\nform.append("file", new Blob([await readFile("audio.wav")], { type: "audio/wav" }), "audio.wav");\nconst response = await fetch("${endpoint}", {\n  method: "POST",\n  headers: { "Authorization": "Bearer <gateway-api-key>" },\n  body: form\n});\nconsole.log(await response.json());`;
+  if (language === "go") return `package main\n\nimport (\n  "bytes"\n  "fmt"\n  "io"\n  "mime/multipart"\n  "net/http"\n  "os"\n)\n\nfunc main() {\n  var body bytes.Buffer\n  writer := multipart.NewWriter(&body)\n  _ = writer.WriteField("model", "${modelID}")\n  part, _ := writer.CreateFormFile("file", "audio.wav")\n  audio, _ := os.Open("audio.wav")\n  _, _ = io.Copy(part, audio)\n  _ = audio.Close()\n  _ = writer.Close()\n  req, _ := http.NewRequest("POST", "${endpoint}", &body)\n  req.Header.Set("Authorization", "Bearer <gateway-api-key>")\n  req.Header.Set("Content-Type", writer.FormDataContentType())\n  res, err := http.DefaultClient.Do(req)\n  if err != nil { panic(err) }\n  defer res.Body.Close()\n  output, _ := io.ReadAll(res.Body)\n  fmt.Println(string(output))\n}`;
+  if (language === "java") return `import java.io.*;\nimport java.net.URI;\nimport java.net.http.*;\nimport java.nio.file.*;\n\nString boundary = "OpenSwiftScaleBoundary";\nvar body = new ByteArrayOutputStream();\nbody.write(("--" + boundary + "\\r\\nContent-Disposition: form-data; name=\\\"model\\\"\\r\\n\\r\\n${modelID}\\r\\n").getBytes());\nbody.write(("--" + boundary + "\\r\\nContent-Disposition: form-data; name=\\\"file\\\"; filename=\\\"audio.wav\\\"\\r\\nContent-Type: audio/wav\\r\\n\\r\\n").getBytes());\nbody.write(Files.readAllBytes(Path.of("audio.wav")));\nbody.write(("\\r\\n--" + boundary + "--\\r\\n").getBytes());\nvar request = HttpRequest.newBuilder(URI.create("${endpoint}"))\n    .header("Authorization", "Bearer <gateway-api-key>")\n    .header("Content-Type", "multipart/form-data; boundary=" + boundary)\n    .POST(HttpRequest.BodyPublishers.ofByteArray(body.toByteArray())).build();\nSystem.out.println(HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString()).body());`;
+  return `use reqwest::{multipart, Client};\n\n#[tokio::main]\nasync fn main() -> Result<(), reqwest::Error> {\n    let form = multipart::Form::new()\n        .text("model", "${modelID}")\n        .file("file", "audio.wav").await?;\n    let response = Client::new().post("${endpoint}")\n        .bearer_auth("<gateway-api-key>")\n        .multipart(form).send().await?;\n    println!("{}", response.text().await?);\n    Ok(())\n}`;
+}
+
+function typedRequestExample(language: ExampleLanguage, baseURL: string, modelID: string, capability: Exclude<ExampleCapability, "text">): string {
+  if (capability === "transcription") return transcriptionRequestExample(language, `${baseURL}/audio/transcriptions`, modelID);
+  const spec = typedRequestSpec(capability, modelID);
+  const endpoint = `${baseURL}/${spec.path}`;
+  const body = JSON.stringify(spec.body);
+  if (language === "curl") return [`curl ${endpoint} \\`, `  -H "Authorization: Bearer <gateway-api-key>" \\`, `  -H "Content-Type: application/json" \\`, `  -d '${body}'`].join("\n");
+  if (language === "python") return `import requests\n\nresponse = requests.post(\n    "${endpoint}",\n    headers={"Authorization": "Bearer <gateway-api-key>"},\n    json=${JSON.stringify(spec.body, null, 4)},\n)\nresponse.raise_for_status()\nprint(response.json())`;
+  if (language === "go") return `package main\n\nimport (\n  "bytes"\n  "fmt"\n  "io"\n  "net/http"\n)\n\nfunc main() {\n  body := []byte(\`${body}\`)\n  req, _ := http.NewRequest("POST", "${endpoint}", bytes.NewReader(body))\n  req.Header.Set("Authorization", "Bearer <gateway-api-key>")\n  req.Header.Set("Content-Type", "application/json")\n  res, err := http.DefaultClient.Do(req)\n  if err != nil { panic(err) }\n  defer res.Body.Close()\n  output, _ := io.ReadAll(res.Body)\n  fmt.Println(string(output))\n}`;
+  if (language === "node") return `const response = await fetch("${endpoint}", {\n  method: "POST",\n  headers: {\n    "Authorization": "Bearer <gateway-api-key>",\n    "Content-Type": "application/json"\n  },\n  body: JSON.stringify(${JSON.stringify(spec.body, null, 2)})\n});\nconsole.log(await response.json());`;
+  if (language === "java") return `import java.net.URI;\nimport java.net.http.*;\n\nvar request = HttpRequest.newBuilder(URI.create("${endpoint}"))\n    .header("Authorization", "Bearer <gateway-api-key>")\n    .header("Content-Type", "application/json")\n    .POST(HttpRequest.BodyPublishers.ofString("${body.replace(/"/g, '\\"')}"))\n    .build();\nSystem.out.println(HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString()).body());`;
+  return `use reqwest::Client;\nuse serde_json::json;\n\n#[tokio::main]\nasync fn main() -> Result<(), reqwest::Error> {\n    let response = Client::new().post("${endpoint}")\n        .bearer_auth("<gateway-api-key>")\n        .json(&json!(${JSON.stringify(spec.body, null, 8)}))\n        .send().await?;\n    println!("{}", response.text().await?);\n    Ok(())\n}`;
+}
+
 function Overview({ status, usage, models, connected }: { status: GatewayStatus | null; usage: UsagePayload | null; models: Model[]; connected: boolean }) {
   const { t } = useI18n();
   const [copied, setCopied] = useState<"url" | "example" | null>(null);
   const [exampleLanguage, setExampleLanguage] = useState<ExampleLanguage>("curl");
+  const [exampleCapability, setExampleCapability] = useState<ExampleCapability>("text");
   const callableModels = useMemo(() => {
     const unique = new Map<string, Model>();
     models.filter((model) => model.available).forEach((model) => { if (!unique.has(model.id)) unique.set(model.id, model); });
@@ -561,9 +691,9 @@ function Overview({ status, usage, models, connected }: { status: GatewayStatus 
     else if (!callableModels.some((model) => model.id === selectedModelID)) setSelectedModelID(callableModels[0].id);
   }, [callableModels, selectedModelID]);
   const apiBaseUrl = status?.api_base_url || fallbackAPIBaseURL();
-  const curlExample = `curl ${apiBaseUrl}/chat/completions \\\n+  -H "Authorization: Bearer <gateway-api-key>" \\\n+  -H "Content-Type: application/json" \\\n+  -d '{"model":"your-model-id","messages":[{"role":"user","content":"Hello"}]}'`;
   const selectedModel = callableModels.find((model) => model.id === selectedModelID) || callableModels[0];
-  const codeExample = selectedModel ? requestExample(exampleLanguage, apiBaseUrl, selectedModel.id) : exampleLanguage === "curl" ? curlExample.replace(/\n\+/g, "\n") : requestExample(exampleLanguage, apiBaseUrl, "your-model-id");
+  const exampleID = selectedModel && tagsForCapabilities(selectedModel.capabilities).includes(exampleCapability as ModelTag) ? selectedModel.id : exampleModelID(exampleCapability);
+  const codeExample = requestExample(exampleLanguage, apiBaseUrl, exampleID, exampleCapability);
   const copyValue = async (kind: "url" | "example", value: string) => {
     await navigator.clipboard.writeText(value);
     setCopied(kind);
@@ -578,15 +708,15 @@ function Overview({ status, usage, models, connected }: { status: GatewayStatus 
     <article className="api-access-card">
       <header>
         <div><p className="section-eyebrow">{t("developerAccess")}</p><h2>{t("gatewayApi")}</h2><span>{t("gatewayApiHelp")}</span></div>
-        <a className="api-docs-link" href="https://github.com/swift-scale-ai/OpenSwiftScale/blob/main/docs/API.md" target="_blank" rel="noreferrer"><BookOpen aria-hidden="true" />{t("apiDocumentation")}</a>
+        <a className="api-docs-link" href="https://github.com/swift-scale-ai/openswiftscale/blob/main/docs/API.md" target="_blank" rel="noreferrer"><BookOpen aria-hidden="true" />{t("apiDocumentation")}</a>
       </header>
       <div className="api-access-grid">
         <section className="api-address-block"><label>{t("apiBaseUrl")}</label><div><code>{apiBaseUrl}</code><button type="button" onClick={() => void copyValue("url", apiBaseUrl)} aria-label={t("copyApiUrl")}>{copied === "url" ? <Check /> : <Copy />}<span>{t(copied === "url" ? "copied" : "copy")}</span></button></div><small>{t("apiBaseHelp")}</small></section>
         <section className="api-auth-block"><label>{t("authentication")}</label><code>Authorization: Bearer &lt;gateway-api-key&gt;</code><small>{t("gatewayKeyLocation")} <code>secrets/gateway_api_keys.txt</code></small></section>
-        <section className="api-endpoints-block"><label>{t("availableEndpoints")}</label><div><code>GET /models</code><code>POST /chat/completions</code><code>POST /responses</code><code>POST /embeddings</code></div></section>
+        <section className="api-endpoints-block"><label>{t("availableEndpoints")}</label><div><PublicInferenceEndpoints /></div></section>
       </div>
       <section className="api-callable-models"><header><div><label>{t("callableModels")}</label><small>{t("callableModelsHelp")}</small></div><span>{callableModels.length}</span></header>{selectedModel ? <div className="callable-model-picker"><select value={selectedModel.id} onChange={(event) => setSelectedModelID(event.target.value)} aria-label={t("callableModels")}>{callableModels.map((model) => <option value={model.id} key={model.id}>{model.name} ({model.id})</option>)}</select><div><strong>{selectedModel.name}</strong><code>{selectedModel.id}</code><small>{t("requestModelHelp")}</small></div></div> : <p className="empty compact-empty">{t("noCallableModels")}</p>}</section>
-      <section className="api-code-examples"><header><div><label>{t("codeExamples")}</label><small>{t("codeExamplesHelp")}</small></div><nav aria-label={t("codeExamples")}>{exampleLanguages.map((language) => <button type="button" className={exampleLanguage === language.id ? "is-active" : ""} onClick={() => setExampleLanguage(language.id)} key={language.id}>{language.label}</button>)}</nav></header><div className="api-example-code"><pre><code>{codeExample}</code></pre><button type="button" onClick={() => void copyValue("example", codeExample)}>{copied === "example" ? <Check /> : <Copy />}{t(copied === "example" ? "copied" : "copyCode")}</button></div></section>
+      <section className="api-code-examples"><header><div><label>{t("codeExamples")}</label><small>{t("codeExamplesHelp")}</small></div><div className="api-example-switchers"><nav aria-label={t("filterByModelTag")}>{exampleCapabilities.map((capability) => <button type="button" className={exampleCapability === capability.id ? "is-active" : ""} onClick={() => setExampleCapability(capability.id)} key={capability.id}>{t(capability.label)}</button>)}</nav><nav aria-label={t("codeExamples")}>{exampleLanguages.map((language) => <button type="button" className={exampleLanguage === language.id ? "is-active" : ""} onClick={() => setExampleLanguage(language.id)} key={language.id}>{language.label}</button>)}</nav></div></header><div className="api-example-code"><pre><code>{codeExample}</code></pre><button type="button" onClick={() => void copyValue("example", codeExample)}>{copied === "example" ? <Check /> : <Copy />}{t(copied === "example" ? "copied" : "copyCode")}</button></div></section>
     </article>
     <OverviewCharts usage={usage} />
   </section>;
@@ -666,13 +796,22 @@ function ChartEmpty({ message }: { message: string }) {
   return <div className="chart-empty"><BarChart3 aria-hidden="true" /><span>{message}</span></div>;
 }
 
-function APIAccess({ users, credentials, connected, onRefresh }: { users: APIUserRecord[]; credentials: AdminCredentials; connected: boolean; onRefresh: () => Promise<void> }) {
+function APIAccess({ users, credentials, connected, status, onRefresh }: { users: APIUserRecord[]; credentials: AdminCredentials; connected: boolean; status: GatewayStatus | null; onRefresh: () => Promise<void> }) {
   const { t, formatDate } = useI18n();
   const [showCreate, setShowCreate] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [revealedKey, setRevealedKey] = useState<{ value: string; name: string } | null>(null);
   const [copied, setCopied] = useState(false);
+  const [copiedApiUrl, setCopiedApiUrl] = useState<"local" | "lan" | null>(null);
+  const [exampleLanguage, setExampleLanguage] = useState<ExampleLanguage>("curl");
+  const [copiedExample, setCopiedExample] = useState<ExampleCapability | null>(null);
+  const [accessAddressMode, setAccessAddressMode] = useState<"local" | "lan">("lan");
+  const fallbackUrl = new URL(fallbackAPIBaseURL());
+  const localApiBaseUrl = status?.local_api_base_url || (() => { fallbackUrl.hostname = "127.0.0.1"; return fallbackUrl.toString().replace(/\/$/, ""); })();
+  const lanApiBaseUrl = status?.lan_api_base_url || (!["127.0.0.1", "localhost", "::1"].includes(window.location.hostname) ? fallbackAPIBaseURL() : "");
+  const selectedApiBaseUrl = accessAddressMode === "lan" ? lanApiBaseUrl : localApiBaseUrl;
+  const exampleBaseUrl = selectedApiBaseUrl || localApiBaseUrl;
 
   const createUser = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -742,14 +881,62 @@ function APIAccess({ users, credentials, connected, onRefresh }: { users: APIUse
     finally { setBusy(false); }
   };
   const visibleKeys = users.flatMap((user) => user.keys.map((key) => ({ user, key })));
+  const copyApiBaseUrl = async (kind: "local" | "lan", value: string) => {
+    await navigator.clipboard.writeText(value);
+    setCopiedApiUrl(kind);
+    window.setTimeout(() => setCopiedApiUrl((current) => current === kind ? null : current), 1600);
+  };
+  const copyCodeExample = async (capability: ExampleCapability) => {
+    await navigator.clipboard.writeText(requestExample(exampleLanguage, exampleBaseUrl, exampleModelID(capability), capability));
+    setCopiedExample(capability);
+    window.setTimeout(() => setCopiedExample((current) => current === capability ? null : current), 1600);
+  };
 
-  return <section className="admin-view admin-panel is-visible api-access-view">
-    <PanelHead eyebrow={t("apiAccess")} title={t("apiKeys")} description={t("simpleApiKeysHelp")} action={<span className="pill neutral">{visibleKeys.length} {t("apiKeys")}</span>} />
-    <form className="api-key-create direct-key-create" onSubmit={(event) => void createDirectKey(event)}><label><span className="sr-only">{t("keyName")}</span><input name="name" required maxLength={100} placeholder={t("keyNamePlaceholder")} /></label><button className="admin-action" disabled={busy || !connected}>{t(busy ? "saving" : "createApiKey")}</button></form>
-    {error && <p className="form-error api-access-error" role="alert">{error}</p>}
-    <div className="api-key-list direct-key-list">{visibleKeys.length ? visibleKeys.map(({ user, key }) => <div className="api-key-row" key={key.id}><span className="key-icon"><KeyRound /></span><div><strong>{key.name}</strong><code>{key.prefix}••••••••</code></div><div><small>{t("created")}</small><span>{formatDate(key.created_at)}</span></div><div><small>{t("lastUsed")}</small><span>{key.last_used_at ? formatDate(key.last_used_at) : t("never")}</span></div><button type="button" onClick={() => void revokeKey(user, key)}>{t("revoke")}</button></div>) : <p className="empty api-key-empty">{t(connected ? "noApiKeysDirect" : "signInAccess")}</p>}</div>
+  return <div className="admin-view is-visible api-access-view">
+    <div className="api-access-page-layout">
+      <div className="api-access-left-column">
+    <section className="admin-panel api-access-method-panel">
+      <PanelHead title={t("apiAccessMethod")} description={t("gatewayApiHelp")} action={null} />
+        <div className="api-client-config">
+          <div className="api-access-grid api-client-config-grid api-access-column">
+            <section className="api-address-block"><div className="api-address-heading"><label>{t("apiBaseUrl")}</label><div className="api-address-mode" role="tablist" aria-label={t("apiBaseUrl")}><button type="button" role="tab" aria-selected={accessAddressMode === "lan"} className={accessAddressMode === "lan" ? "is-active" : ""} onClick={() => setAccessAddressMode("lan")}>{t("lanApiBaseUrl")}</button><button type="button" role="tab" aria-selected={accessAddressMode === "local"} className={accessAddressMode === "local" ? "is-active" : ""} onClick={() => setAccessAddressMode("local")}>{t("localApiBaseUrl")}</button></div></div><div className="api-address-entry"><div><code>{selectedApiBaseUrl || t("lanAddressUnavailable")}</code><button type="button" disabled={!selectedApiBaseUrl} onClick={() => void copyApiBaseUrl(accessAddressMode, selectedApiBaseUrl)} aria-label={t("copyApiUrl")}>{copiedApiUrl === accessAddressMode ? <Check /> : <Copy />}<span>{t(copiedApiUrl === accessAddressMode ? "copied" : "copy")}</span></button></div><p>{t(accessAddressMode === "lan" ? "lanApiBaseHelp" : "localApiBaseHelp")}</p></div></section>
+            <section className="api-request-details">
+              <div className="api-auth-block"><label>{t("authentication")}</label><code>Authorization: Bearer &lt;gateway-api-key&gt;</code><small>{t("simpleApiKeysHelp")}</small></div>
+              <div className="api-endpoints-block"><label>{t("availableEndpoints")}</label><div><PublicInferenceEndpoints /></div></div>
+            </section>
+          </div>
+        </div>
+    </section>
+    <section className="admin-panel api-keys-panel">
+      <PanelHead title={t("apiKeys")} description={t("simpleApiKeysHelp")} action={<span className="pill neutral">{visibleKeys.length} {t("apiKeys")}</span>} />
+      <form className="api-key-create direct-key-create" onSubmit={(event) => void createDirectKey(event)}><label><span className="sr-only">{t("keyName")}</span><input name="name" required maxLength={100} placeholder={t("keyNamePlaceholder")} /></label><button className="admin-action" disabled={busy || !connected}>{t(busy ? "saving" : "createApiKey")}</button></form>
+      {error && <p className="form-error api-access-error" role="alert">{error}</p>}
+      <div className="api-key-list direct-key-list">{visibleKeys.length ? visibleKeys.map(({ user, key }) => <div className="api-key-row" key={key.id}><span className="key-icon"><KeyRound /></span><div><strong>{key.name}</strong><code>{key.prefix}••••••••</code></div><div><small>{t("created")}</small><span>{formatDate(key.created_at)}</span></div><div><small>{t("lastUsed")}</small><span>{key.last_used_at ? formatDate(key.last_used_at) : t("never")}</span></div><button type="button" onClick={() => void revokeKey(user, key)}>{t("revoke")}</button></div>) : <p className="empty api-key-empty">{t(connected ? "noApiKeysDirect" : "signInAccess")}</p>}</div>
+    </section>
+      </div>
+      <section className="api-code-examples api-access-code-examples">
+        <header>
+          <div className="api-example-heading"><label>{t("codeExamples")}</label><small>{t("codeExamplesHelp")}</small></div>
+          <div className="api-example-switchers">
+            <div className="api-example-switcher-group language-switcher">
+              <span>{t("language")}</span>
+              <nav aria-label={t("language")}>{exampleLanguages.map((language) => <button type="button" className={exampleLanguage === language.id ? "is-active" : ""} onClick={() => setExampleLanguage(language.id)} key={language.id}>{language.label}</button>)}</nav>
+            </div>
+          </div>
+        </header>
+        <div className="api-example-collection">
+          {exampleCapabilities.map((capability, index) => {
+            const example = requestExample(exampleLanguage, exampleBaseUrl, exampleModelID(capability.id), capability.id);
+            return <details className="api-example-section" open={index === 0} key={`${exampleLanguage}-${capability.id}`}>
+              <summary><span><strong>{t(capability.label)}</strong><code>{exampleModelID(capability.id)}</code></span></summary>
+              <div className="api-example-code"><pre><code>{example}</code></pre><button type="button" onClick={() => void copyCodeExample(capability.id)}>{copiedExample === capability.id ? <Check /> : <Copy />}{t(copiedExample === capability.id ? "copied" : "copyCode")}</button></div>
+            </details>;
+          })}
+        </div>
+      </section>
+    </div>
     {revealedKey && <div className="dialog-backdrop" role="presentation"><section className="secret-dialog" role="dialog" aria-modal="true" aria-labelledby="new-api-key-title"><div className="dialog-title"><div><p className="section-eyebrow">{t("apiKeyCreated")}</p><h2 id="new-api-key-title">{revealedKey.name}</h2><p>{t("copyKeyNow")}</p></div><button className="icon-button" type="button" onClick={() => { setRevealedKey(null); setCopied(false); }} aria-label={t("close")}><X /></button></div><div className="revealed-secret"><code>{revealedKey.value}</code><button type="button" onClick={() => void copySecret()}>{copied ? <Check /> : <Copy />}{t(copied ? "copied" : "copy")}</button></div><p className="secret-warning">{t("keyShownOnce")}</p><div className="dialog-actions"><button className="admin-action" type="button" onClick={() => { setRevealedKey(null); setCopied(false); }}>{t("done")}</button></div></section></div>}
-  </section>;
+  </div>;
 }
 
 const modelVendorLabels: Record<string, string> = {
@@ -881,12 +1068,25 @@ function ModelWorkspace({ models, families, providers, connected, onAdd, onEdit,
         <div className="transparent-nav-summary endpoint-column-title"><strong>{t("modelIdAndEndpoints")}</strong><span>{modelOptions.length > 0 ? selectedRoutes.length : familyHasOfficialEndpoint ? 1 : 0} {t((modelOptions.length > 0 ? selectedRoutes.length : familyHasOfficialEndpoint ? 1 : 0) === 1 ? "endpoint" : "endpoints")}</span></div>
         <header className="selected-model-heading"><div className="selected-model-context"><span>{selectedVendor} · {selectedFamilyMeta?.name || modelFamilyLabels[selectedFamily] || selectedFamily}</span></div>{modelOptions.length > 0 ? <div className="model-id-selection"><p>{t("sameModelOnly")}</p><div className="model-id-route-controls"><label><span className="sr-only">{t("modelId")}</span><select value={selectedModelID} onChange={(event) => setSelectedModelID(event.target.value)} aria-label={t("modelId")}>{modelOptions.map(([modelID, routes]) => <option key={modelID} value={modelID}>{routes[0].name} · {modelID} · {tagsForCapabilities(routes[0].capabilities).map((tag) => t(modelTagFilters.find((item) => item.id === tag)?.label || "tagText")).join(" / ")}</option>)}</select></label><button type="button" className="route-settings-button" onClick={() => onManageRoute(selectedModelID)}><GripVertical aria-hidden="true" />{t("routeSettings")}</button></div></div> : <div className="model-id-selection is-unavailable"><p>{t(selectedFamilyHelp)}</p><div className="model-id-route-controls"><label><span className="sr-only">{t("modelId")}</span><select disabled aria-label={t("modelId")}><option>{t("noRoutableModelId")}</option></select></label><button type="button" className="route-settings-button" disabled><GripVertical aria-hidden="true" />{t("routeSettings")}</button></div></div>}</header>
         {modelOptions.length > 0 && <section className="configured-model-summary"><div className="family-catalog-facts"><article><small>{t("modelType")}</small><strong>{selectedFamilyType || t("familyTypeOther")}</strong></article><article><small>{t("modelId")}</small><code>{selectedModelID}</code><span>{selectedRoutes[0]?.name}</span><div className="model-id-tags">{selectedModelTags.map((tag) => <span key={tag}>{t(modelTagFilters.find((item) => item.id === tag)?.label || "tagText")}</span>)}</div></article><article><small>{t("currentAccess")}</small><strong>{selectedOfficialRoutes.length} {t("officialEndpoints")} · {selectedThirdPartyRoutes.length} {t("thirdPartyEndpoints")}</strong><span className={`state ${selectedModelStatus === "ready" ? "on" : "off"}`}>{t(selectedModelStatus)}</span></article></div></section>}
-        {modelOptions.length === 0 ? <div className="family-catalog-empty"><section className="family-catalog-summary"><div className="family-catalog-facts"><article><small>{t("modelType")}</small><strong>{selectedFamilyType || t("familyTypeOther")}</strong></article><article><small>{t("modelId")}</small><code>—</code><span>{t("notConfigured")}</span></article><article><small>{t("currentAccess")}</small><strong>{familyHasOfficialEndpoint ? 1 : 0} {t("officialEndpoints")} · 0 {t("thirdPartyEndpoints")}</strong><span className={`state ${selectedFamilyStatus === "ready" ? "on" : "off"}`}>{t(selectedFamilyStatus)}</span></article></div></section>{familyHasOfficialEndpoint && <section className="endpoint-group family-official-endpoint"><header><strong>{t("officialEndpoints")}</strong><span>1</span></header><div className="endpoint-table-wrap"><table className="endpoint-table"><thead><tr><th>#</th><th>{t("provider")}</th><th>{t("modelId")}</th><th className="endpoint-address-column">{t("endpointAddress")}</th><th>{t("routePolicy")}</th><th>{t("inputPrice")}</th><th>{t("outputPrice")}</th><th>{t("status")}</th><th /></tr></thead><tbody><tr><td><span className="route-order is-primary">1</span></td><td><strong>{officialFamilyProvider?.name || selectedVendor}</strong><small>{t("official")}</small></td><td>—</td><td className="endpoint-address"><code title={familyOfficialEndpoint}>{familyOfficialEndpoint}</code><small>{officialFamilyProvider?.type || t(selectedFamilyMeta?.official_access === "self-hosted" ? "selfHostedAccess" : "dedicatedDeployment")}</small></td><td>—<small>{t("notConfigured")}</small></td><td>—<small>{t("notConfigured")}</small></td><td>—<small>{t("notConfigured")}</small></td><td><span className={`state ${selectedFamilyRouteable && officialFamilyProvider?.enabled && officialFamilyProvider?.has_api_key ? "on" : "off"}`}>{t(selectedFamilyStatus)}</span></td><td><div className="endpoint-row-actions">{officialFamilyProvider && <button type="button" onClick={() => onEdit(officialFamilyProvider)}>{t("configure")}</button>}</div></td></tr></tbody></table></div></section>}</div> : <>{endpointGroups.map((group) => <section className={`endpoint-group endpoint-group-${group.id}`} key={group.id}><header><strong>{group.title}</strong><span>{group.routes.length}</span></header><div className="endpoint-table-wrap"><table className="endpoint-table"><thead><tr><th>#</th><th>{t("provider")}</th><th>{t("modelId")}</th><th className="endpoint-address-column">{t("endpointAddress")}</th><th>{t("routePolicy")}</th><th>{t("inputPrice")}</th><th>{t("outputPrice")}</th><th>{t("status")}</th><th /></tr></thead><tbody>
+        {modelOptions.length === 0 ? <div className="family-catalog-empty"><section className="family-catalog-summary"><div className="family-catalog-facts"><article><small>{t("modelType")}</small><strong>{selectedFamilyType || t("familyTypeOther")}</strong></article><article><small>{t("modelId")}</small><code>—</code><span>{t("notConfigured")}</span></article><article><small>{t("currentAccess")}</small><strong>{familyHasOfficialEndpoint ? 1 : 0} {t("officialEndpoints")} · 0 {t("thirdPartyEndpoints")}</strong><span className={`state ${selectedFamilyStatus === "ready" ? "on" : "off"}`}>{t(selectedFamilyStatus)}</span></article></div></section>{familyHasOfficialEndpoint && <section className="endpoint-group family-official-endpoint"><header><strong>{t("officialEndpoints")}</strong><span>1</span></header><div className="endpoint-table-wrap"><table className="endpoint-table"><thead><tr><th>#</th><th>{t("provider")}</th><th>{t("modelId")}</th><th className="endpoint-address-column">{t("endpointAddress")}</th><th>{t("endpointRegion")}</th><th>{t("routePolicy")}</th><th>{t("inputPrice")}</th><th>{t("outputPrice")}</th><th>{t("status")}</th><th /></tr></thead><tbody><tr><td><span className="route-order is-primary">1</span></td><td><strong>{officialFamilyProvider?.name || selectedVendor}</strong><small>{t("official")}</small></td><td>—</td><td className="endpoint-address"><code title={familyOfficialEndpoint}>{familyOfficialEndpoint}</code><small>{officialFamilyProvider?.type || t(selectedFamilyMeta?.official_access === "self-hosted" ? "selfHostedAccess" : "dedicatedDeployment")}</small></td><td className="endpoint-region"><strong>{endpointRegionLabel(officialFamilyProvider?.region, t)}</strong><small>{normalizeEndpointRegion(officialFamilyProvider?.region)}</small></td><td>—<small>{t("notConfigured")}</small></td><td>—<small>{t("notConfigured")}</small></td><td>—<small>{t("notConfigured")}</small></td><td><span className={`state ${selectedFamilyRouteable && officialFamilyProvider?.enabled && officialFamilyProvider?.has_api_key ? "on" : "off"}`}>{t(selectedFamilyStatus)}</span></td><td><div className="endpoint-row-actions">{officialFamilyProvider && <button type="button" onClick={() => onEdit(officialFamilyProvider)}>{t("configure")}</button>}</div></td></tr></tbody></table></div></section>}</div> : <>{endpointGroups.map((group) => <section className={`endpoint-group endpoint-group-${group.id}`} key={group.id}><header><strong>{group.title}</strong><span>{group.routes.length}</span></header><div className="endpoint-table-wrap"><table className="endpoint-table"><thead><tr><th>#</th><th>{t("provider")}</th><th>{t("modelId")}</th><th className="endpoint-address-column">{t("endpointAddress")}</th><th>{t("endpointRegion")}</th><th>{t("routePolicy")}</th><th>{t("inputPrice")}</th><th>{t("outputPrice")}</th><th>{t("status")}</th><th /></tr></thead><tbody>
           {group.routes.map((route) => {
             const provider = providerByID.get(route.provider);
             const ready = Boolean(provider?.enabled && provider?.has_api_key);
+            const endpointState: MessageKey = !ready ? "noKey" : provider?.validation_status === "valid" ? "verified" : provider?.validation_status === "invalid" ? "credentialInvalid" : provider?.validation_status === "temporarily_unavailable" ? "temporarilyUnavailable" : "unverified";
             const routeIndex = selectedRoutes.findIndex((item) => item.id === route.id && item.provider === route.provider);
-            return <tr key={`${route.id}:${route.provider}`}><td><span className={`route-order${routeIndex === 0 ? " is-primary" : ""}`}>{routeIndex + 1}</span></td><td><strong>{provider?.name || route.provider}</strong><small>{provider?.official ? t("official") : t("thirdParty")}</small></td><td className="endpoint-model-id"><code>{route.id}</code>{route.upstream_model !== route.id && <small>{t("upstreamModelId")}: {route.upstream_model}</small>}</td><td className="endpoint-address"><code title={provider?.base_url || ""}>{provider?.base_url || "—"}</code></td><td className="endpoint-route-policy"><strong>{t("priority")} {route.priority}</strong><small>{t("weight")} {route.weight}</small></td><td>{route.pricing ? `${route.pricing.currency || "USD"} ${route.pricing.input_per_million.toFixed(2)}` : "—"}<small>{t("perMillionTokens")}</small></td><td>{route.pricing ? `${route.pricing.currency || "USD"} ${route.pricing.output_per_million.toFixed(2)}` : "—"}<small>{t("perMillionTokens")}</small></td><td><span className={`state ${ready ? "on" : "off"}`}>{t(ready ? "ready" : "noKey")}</span></td><td><div className="endpoint-row-actions">{provider && <button type="button" onClick={() => onEdit(provider)}>{t("configure")}</button>}{provider && !provider.official && <button className="delete" type="button" onClick={() => onDelete(provider)}>{t("delete")}</button>}</div></td></tr>;
+            const samples = (route.success_count || 0) + (route.failure_count || 0);
+            return <tr key={`${route.id}:${route.provider}`}>
+              <td><span className={`route-order${routeIndex === 0 ? " is-primary" : ""}`}>{routeIndex + 1}</span></td>
+              <td><strong>{provider?.name || route.provider}</strong><small>{provider?.official ? t("official") : t("thirdParty")}</small></td>
+              <td className="endpoint-model-id"><code>{route.id}</code>{route.upstream_model !== route.id && <small>{t("upstreamModelId")}: {route.upstream_model}</small>}</td>
+              <td className="endpoint-address"><code title={provider?.base_url || ""}>{provider?.base_url || "—"}</code></td>
+              <td className="endpoint-region"><strong>{endpointRegionLabel(provider?.region, t)}</strong><small>{normalizeEndpointRegion(provider?.region)}</small></td>
+              <td className="endpoint-route-policy"><strong>{route.platform_score ? `${t("platformScore")} ${route.platform_score.toFixed(1)}` : `${t("priority")} ${route.priority}`}</strong><small>{t("availability")} {samples ? `${(((route.success_count || 0) / samples) * 100).toFixed(1)}%` : t("noSamples")} · {Math.round(route.latency_ewma_ms || 0)} ms</small></td>
+              <td>{route.pricing ? `${route.pricing.currency || "USD"} ${route.pricing.input_per_million.toFixed(2)}` : "—"}<small>{t("perMillionTokens")}</small></td>
+              <td>{route.pricing ? `${route.pricing.currency || "USD"} ${route.pricing.output_per_million.toFixed(2)}` : "—"}<small>{t("perMillionTokens")}</small></td>
+              <td><span className={`state ${endpointState === "verified" ? "on" : "off"}`}>{t(endpointState)}</span></td>
+              <td><div className="endpoint-row-actions">{provider && <button type="button" onClick={() => onEdit(provider)}>{t("configure")}</button>}{provider && !provider.official && <button className="delete" type="button" onClick={() => onDelete(provider)}>{t("delete")}</button>}</div></td>
+            </tr>;
           })}
         </tbody></table></div></section>)}
         <footer className="routing-principle"><Check aria-hidden="true" /><div><strong>{t("transparentRouting")}</strong><span>{t("transparentRoutingHelp")}</span></div></footer></>}
@@ -912,8 +1112,15 @@ function SimpleRouteSettingsDialog({ modelID, credentials, onClose, onSaved }: {
     return () => { active = false; };
   }, [credentials, modelID]);
 
+  const routeMode = settings?.routing_mode || (settings?.use_platform_default ? "platform" : "failover");
+
+  const setRouteMode = (routingMode: "platform" | "failover" | "weighted") => {
+    if (!settings) return;
+    setSettings({ ...settings, routing_mode: routingMode, use_platform_default: routingMode === "platform" });
+  };
+
   const moveEndpoint = (targetProvider: string) => {
-    if (!settings || settings.use_platform_default || !draggingProvider || draggingProvider === targetProvider) return;
+    if (!settings || routeMode !== "failover" || !draggingProvider || draggingProvider === targetProvider) return;
     const endpoints = [...settings.endpoints];
     const from = endpoints.findIndex((endpoint) => endpoint.provider_id === draggingProvider);
     const to = endpoints.findIndex((endpoint) => endpoint.provider_id === targetProvider);
@@ -936,7 +1143,7 @@ function SimpleRouteSettingsDialog({ modelID, credentials, onClose, onSaved }: {
     try {
       await api<ModelRouteSettingsPayload>(`/api/admin/model-routes/${encodeURIComponent(modelID)}`, credentials, {
         method: "PATCH",
-        body: JSON.stringify({ use_platform_default: settings.use_platform_default, endpoints: settings.endpoints })
+        body: JSON.stringify({ use_platform_default: routeMode === "platform", routing_mode: routeMode, preferred_region: settings.preferred_region || "global", endpoints: settings.endpoints })
       });
       await onSaved();
     } catch (cause) {
@@ -950,16 +1157,18 @@ function SimpleRouteSettingsDialog({ modelID, credentials, onClose, onSaved }: {
     <section className="simple-route-dialog" role="dialog" aria-modal="true" aria-labelledby="simple-route-dialog-title">
       <div className="dialog-title"><div><p className="section-eyebrow">{t("transparentRouting")}</p><h2 id="simple-route-dialog-title">{t("routeSettings")}</h2><p><code>{modelID}</code> · {t("simpleRouteSettingsHelp")}</p></div><button type="button" className="icon-button" onClick={onClose} aria-label={t("close")}><X /></button></div>
       {settings ? <>
-        <label className="platform-default-switch"><span><strong>{t("usePlatformDefault")}</strong><small>{t("platformDefaultHelp")}</small></span><input type="checkbox" checked={settings.use_platform_default} onChange={(event) => setSettings({ ...settings, use_platform_default: event.target.checked })} /><i aria-hidden="true" /></label>
-        <div className={`simple-route-list${settings.use_platform_default ? " is-default" : ""}`}>
-          <div className="simple-route-list-head"><span>{t("endpointOrder")}</span><span>{t("participatesInRouting")}</span><span>{t("trafficWeight")}</span></div>
-          {settings.endpoints.map((endpoint, index) => <article key={endpoint.provider_id} draggable={!settings.use_platform_default} onDragStart={() => setDraggingProvider(endpoint.provider_id)} onDragEnd={() => setDraggingProvider("")} onDragOver={(event) => { if (!settings.use_platform_default) event.preventDefault(); }} onDrop={() => moveEndpoint(endpoint.provider_id)} className={draggingProvider === endpoint.provider_id ? "is-dragging" : ""}>
-            <div className="simple-route-identity"><span className="route-drag-handle" title={t("dragToReorder")}><GripVertical aria-hidden="true" /></span><b>{index + 1}</b><div><strong>{endpoint.name}</strong><small>{endpoint.official ? t("official") : t("thirdParty")} · {endpoint.base_url}</small></div></div>
+        <label className="platform-default-switch"><span><strong>{t("usePlatformDefault")}</strong><small>{t("platformDefaultHelp")}</small></span><input type="checkbox" checked={routeMode === "platform"} onChange={(event) => setRouteMode(event.target.checked ? "platform" : "failover")} /><i aria-hidden="true" /></label>
+        {routeMode === "platform" && <label className="route-region-preference"><span><strong>{t("preferredRegion")}</strong><small>{t("preferredRegionHelp")}</small></span><select value={settings.preferred_region || "global"} onChange={(event) => setSettings({ ...settings, preferred_region: event.target.value })}>{endpointRegionOptions.map((option) => <option key={option.value} value={option.value}>{t(option.label)}</option>)}</select></label>}
+        {routeMode !== "platform" && <fieldset className="manual-route-mode"><legend>{t("manualRoutingMode")}</legend><label className={routeMode === "failover" ? "is-active" : ""}><input type="radio" name="routing-mode" checked={routeMode === "failover"} onChange={() => setRouteMode("failover")} /><span><strong>{t("sequentialFailover")}</strong><small>{t("sequentialFailoverHelp")}</small></span></label><label className={routeMode === "weighted" ? "is-active" : ""}><input type="radio" name="routing-mode" checked={routeMode === "weighted"} onChange={() => setRouteMode("weighted")} /><span><strong>{t("weightedDistribution")}</strong><small>{t("weightedDistributionHelp")}</small></span></label></fieldset>}
+        <div className={`simple-route-list is-${routeMode}`}>
+          <div className="simple-route-list-head"><span>{t(routeMode === "failover" ? "endpointOrder" : "routingEndpoints")}</span><span>{t("participatesInRouting")}</span>{routeMode === "weighted" && <span>{t("trafficWeight")}</span>}</div>
+          {settings.endpoints.map((endpoint, index) => <article key={endpoint.provider_id} draggable={routeMode === "failover"} onDragStart={() => setDraggingProvider(endpoint.provider_id)} onDragEnd={() => setDraggingProvider("")} onDragOver={(event) => { if (routeMode === "failover") event.preventDefault(); }} onDrop={() => moveEndpoint(endpoint.provider_id)} className={draggingProvider === endpoint.provider_id ? "is-dragging" : ""}>
+            <div className="simple-route-identity"><span className="route-drag-handle" title={routeMode === "failover" ? t("dragToReorder") : undefined}><GripVertical aria-hidden="true" /></span><b>{index + 1}</b><div><strong>{endpoint.name}</strong><small>{endpoint.official ? t("official") : t("thirdParty")} · {endpointRegionLabel(endpoint.region, t)} · {endpoint.base_url}</small><small>{t("availability")} {(endpoint.availability * 100).toFixed(1)}% · {t("qualityLatency")} {Math.round(endpoint.latency_ewma_ms || 0)} ms{routeMode === "platform" ? ` · ${t("platformScore")} ${endpoint.platform_score.toFixed(1)}` : ""}</small></div></div>
             <label className="route-enabled-toggle"><input type="checkbox" checked={endpoint.enabled} onChange={(event) => updateEndpoint(endpoint.provider_id, { enabled: event.target.checked })} /><span>{t(endpoint.enabled ? "included" : "excluded")}</span></label>
-            <label className="route-weight-input"><span className="sr-only">{t("trafficWeight")}</span><input type="number" min="1" max="10000" value={endpoint.weight} disabled={settings.use_platform_default || !endpoint.enabled} onChange={(event) => updateEndpoint(endpoint.provider_id, { weight: Math.max(1, Number(event.target.value) || 1) })} /></label>
+            {routeMode === "weighted" && <label className="route-weight-input"><span className="sr-only">{t("trafficWeight")}</span><input type="number" min="1" max="10000" value={endpoint.weight} disabled={!endpoint.enabled} onChange={(event) => updateEndpoint(endpoint.provider_id, { weight: Math.max(1, Number(event.target.value) || 1) })} /></label>}
           </article>)}
         </div>
-        <p className="simple-route-note">{t(settings.use_platform_default ? "platformDefaultActive" : "manualRouteActive")}</p>
+        <p className="simple-route-note">{t(routeMode === "platform" ? "platformDefaultActive" : routeMode === "weighted" ? "weightedRouteActive" : "manualRouteActive")}</p>
       </> : !error && <p className="empty">{t("loading")}</p>}
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="dialog-actions"><button type="button" className="panel-action" onClick={onClose}>{t("cancel")}</button><button type="button" className="admin-action" disabled={busy || !settings} onClick={() => void save()}>{t(busy ? "saving" : "saveRouteSettings")}</button></div>
@@ -989,9 +1198,9 @@ function Connections({ providers, connected, onAdd, onEdit, onDelete }: { provid
     <footer>{!provider.official && <button className="delete" type="button" onClick={() => onDelete(provider)}>{t("delete")}</button>}<button type="button" onClick={() => onEdit(provider)}>{t("configure")}</button></footer>
   </article>;
   return <section className="admin-view admin-panel is-visible">
-    <PanelHead eyebrow={t("providerConnections")} title={t("bringKeys")} description={t("connectionHelp")} action={<button className="admin-action" type="button" onClick={onAdd}>{t("addCustomEndpoint")}</button>} />
+    <PanelHead title={t("bringKeys")} description={t("connectionHelp")} action={<button className="admin-action" type="button" onClick={onAdd}>{t("addCustomEndpoint")}</button>} />
     {providers.length ? <div className="provider-categories">{categories.map((category) => <section className={`provider-category ${category.id}`} key={category.id}>
-      <header><div><h3>{category.title}</h3><p>{category.description}</p></div><span>{category.providers.length} connection{category.providers.length === 1 ? "" : "s"}</span></header>
+      <header><div><h3>{category.title}</h3><p>{category.description}</p></div><span>{category.providers.length} {t(category.providers.length === 1 ? "endpoint" : "endpoints")}</span></header>
       <div className="endpoint-groups">
         {[{ id: "official", title: t("officialEndpoints"), description: t("officialHelp"), items: category.providers.filter((provider) => provider.official) }, { id: "third-party", title: t("thirdPartyEndpoints"), description: t("thirdPartyHelp"), items: category.providers.filter((provider) => !provider.official) }].map((group) => <section className="endpoint-group" key={group.id}>
           <header><div><h4>{group.title}</h4><p>{group.description}</p></div><span>{group.items.length}</span></header>
@@ -1026,7 +1235,7 @@ function Models({ models, policies, rules, connected, onCreateRoute, onManageRou
   const visibleGroups = selectedFamily === "all" ? groups : groups.filter(([, routes]) => modelBrandKey(routes[0]) === selectedFamily);
   const modelByID = useMemo(() => new Map(groups.map(([modelID, routes]) => [modelID, routes[0]])), [groups]);
   return <section className="admin-view admin-panel is-visible">
-    <PanelHead eyebrow={t("modelRouting")} title={t("routeRules")} description={t("routeRulesHelp")} action={<button className="admin-action" type="button" onClick={onCreateRoute}>{t("createRouteRule")}</button>} />
+    <PanelHead title={t("routeRules")} description={t("routeRulesHelp")} action={<button className="admin-action" type="button" onClick={onCreateRoute}>{t("createRouteRule")}</button>} />
     <section className="routing-intro">
       <div><strong>{t("howRoutingWorks")}</strong><p>{t("routingExplanation")}</p></div>
       <div className="routing-legend"><span><b>1</b> {t("matchModel")}</span><span><b>2</b> {t("selectPriority")}</span><span><b>3</b> {t("balanceFailover")}</span></div>
@@ -1038,12 +1247,12 @@ function Models({ models, policies, rules, connected, onCreateRoute, onManageRou
         <header><div><strong>{rule.name}</strong><span>{t("routeId")} · {rule.id}</span></div><div><span className={`state ${rule.enabled ? "on" : "off"}`}>{t(rule.enabled ? "enabled" : "disabled")}</span><button type="button" onClick={() => onEditRule(rule)}>{t("edit")}</button><button className="delete" type="button" onClick={() => onDeleteRule(rule)}>{t("delete")}</button></div></header>
         <div className="routing-rule-chain">{[...rule.members].sort((left, right) => left.priority - right.priority || left.model_id.localeCompare(right.model_id)).map((member, index) => {
           const memberModel = modelByID.get(member.model_id);
-          return <div className="routing-rule-member" key={member.model_id}><span className={`chain-order${index === 0 ? " is-primary" : ""}`}>{index === 0 ? "✓" : index + 1}</span><div><strong>{memberModel?.name || member.model_id}</strong><small>{member.model_id}</small><span>Priority {member.priority} · Weight {member.weight}</span></div></div>;
+          return <div className="routing-rule-member" key={member.model_id}><span className={`chain-order${index === 0 ? " is-primary" : ""}`}>{index === 0 ? "✓" : index + 1}</span><div><strong>{memberModel?.name || member.model_id}</strong><small>{member.model_id}</small><span>{t("priority")} {member.priority} · {t("weight")} {member.weight}</span></div></div>;
         })}</div>
       </article>) : <p className="empty compact-empty">{t("noAliases")}</p>}</div>
     </details>
     {groups.length ? <div className="model-catalog-layout">
-      <aside className="model-family-nav" aria-label="Model families">
+      <aside className="model-family-nav" aria-label={t("modelFamily")}>
         <div className="family-nav-title"><span>{t("routeFamilies")}</span><small>{groups.length} {t("rules")}</small></div>
         <button type="button" className={selectedFamily === "all" ? "is-active" : ""} onClick={() => setSelectedFamily("all")} aria-current={selectedFamily === "all" ? "page" : undefined}><span>{t("allRules")}</span><strong>{groups.length}</strong></button>
         {families.map(([family, count]) => <button type="button" key={family} className={selectedFamily === family ? "is-active" : ""} onClick={() => setSelectedFamily(family)} aria-current={selectedFamily === family ? "page" : undefined}><span>{modelFamilyLabels[family] || family}</span><strong>{count}</strong></button>)}
@@ -1072,20 +1281,20 @@ function Models({ models, policies, rules, connected, onCreateRoute, onManageRou
   </section>;
 }
 
-function Usage({ usage, onRefresh }: { usage: UsagePayload | null; onRefresh: () => void }) {
+function Monitoring({ usage, page, pageSize, operational, status, onPageChange, onRefresh }: { usage: UsagePayload | null; page: number; pageSize: number; operational: OperationalState; status: GatewayStatus | null; onPageChange: (page: number) => void; onRefresh: () => void }) {
   const { t, formatDate } = useI18n();
-  return <section className="admin-view admin-panel is-visible">
-    <PanelHead eyebrow={t("localObservability")} title={t("recentRequests")} description={t("usageHelp")} action={<button className="panel-action" type="button" onClick={onRefresh}>{t("refresh")}</button>} />
-    <div className="table-wrap"><table><thead><tr><th>{t("time")}</th><th>{t("model")}</th><th>{t("provider")}</th><th>{t("status")}</th><th>{t("tokens")}</th><th>{t("latency")}</th><th>{t("cost")}</th></tr></thead><tbody>{usage?.recent?.length ? usage.recent.map((item) => <tr key={`${item.created_at}-${item.model}`}><td>{formatDate(item.created_at)}</td><td>{item.model}</td><td>{item.provider}</td><td className={item.status < 400 ? "ok" : "bad"}>{item.status}</td><td>{number(item.prompt_tokens + item.completion_tokens)}</td><td>{number(item.latency_ms)} ms</td><td>{money(item.cost_usd)}</td></tr>) : <tr><td colSpan={7} className="empty">{t("noUsage")}</td></tr>}</tbody></table></div>
-  </section>;
-}
-
-function Health({ operational, status, onRefresh }: { operational: OperationalState; status: GatewayStatus | null; onRefresh: () => void }) {
-  const { t } = useI18n();
   const stateLabel = (value: OperationalState["service"] | OperationalState["database"]) => t(value === "ready" ? "readyState" : value === "healthy" ? "healthy" : value === "unavailable" ? "unavailable" : "checking");
+  const total = Number(usage?.pagination?.total ?? usage?.summary.requests ?? 0);
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const currentPage = Math.min(page, totalPages);
   return <section className="admin-view admin-panel is-visible">
-    <PanelHead eyebrow={t("operationalStatus")} title={t("gatewayHealth")} description={t("healthHelp")} action={<button className="panel-action" type="button" onClick={onRefresh}>{t("refresh")}</button>} />
+    <PanelHead title={t("gatewayHealth")} description={t("healthHelp")} action={<button className="panel-action" type="button" onClick={onRefresh}>{t("refresh")}</button>} />
     <div className="health-grid"><HealthCard label={t("httpService")} value={stateLabel(operational.service)} detail="/healthz" healthy={operational.service === "healthy" ? true : operational.service === "unavailable" ? false : undefined} /><HealthCard label={t("databaseReadiness")} value={stateLabel(operational.database)} detail="/readyz" healthy={operational.database === "ready" ? true : operational.database === "unavailable" ? false : undefined} /><HealthCard label={t("processUptime")} value={status ? formatDuration(status.uptime_seconds) : t("connectDetails")} detail={t("currentProcess")} /></div>
+    <section className="monitoring-requests">
+      <PanelHead title={t("recentRequests")} description={t("usageHelp")} action={null} />
+      <div className="table-wrap"><table><thead><tr><th>{t("time")}</th><th>{t("model")}</th><th>{t("provider")}</th><th>{t("status")}</th><th>{t("tokens")}</th><th>{t("latency")}</th><th>{t("cost")}</th></tr></thead><tbody>{usage?.recent?.length ? usage.recent.map((item) => <tr key={`${item.created_at}-${item.model}`}><td>{formatDate(item.created_at)}</td><td>{item.model}</td><td>{item.provider}</td><td className={item.status < 400 ? "ok" : "bad"}>{item.status}</td><td>{number(item.prompt_tokens + item.completion_tokens)}</td><td>{number(item.latency_ms)} ms</td><td>{money(item.cost_usd)}</td></tr>) : <tr><td colSpan={7} className="empty">{t("noUsage")}</td></tr>}</tbody></table></div>
+      <div className="request-pagination"><span>{number(total)} {t("requests")}</span><div><button type="button" disabled={currentPage <= 1} onClick={() => onPageChange(currentPage - 1)}>{t("previousPage")}</button><strong>{currentPage} / {totalPages}</strong><button type="button" disabled={currentPage >= totalPages} onClick={() => onPageChange(currentPage + 1)}>{t("nextPage")}</button></div></div>
+    </section>
   </section>;
 }
 
@@ -1093,14 +1302,15 @@ function HealthCard({ label, value, detail, healthy }: { label: string; value: s
   return <article className="health-card"><span>{label}</span><strong className={healthy === true ? "ok" : healthy === false ? "bad" : ""}>{value}</strong><small>{detail}</small></article>;
 }
 
-function PanelHead({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action: ReactNode }) {
-  return <div className="panel-head"><div><p className="section-eyebrow">{eyebrow}</p><h2>{title}</h2><p>{description}</p></div>{action}</div>;
+function PanelHead({ title, description, action }: { title: string; description: string; action: ReactNode }) {
+  return <div className="panel-head"><div><h2>{title}</h2><p>{description}</p></div>{action}</div>;
 }
 
 interface NewRouteEndpoint {
   id: string;
   name: string;
   base_url: string;
+  region: string;
   upstream_model: string;
   api_key: string;
   priority: number;
@@ -1151,6 +1361,7 @@ function ModelRouteWizard({ initialModelID, models, providers, credentials, onCl
       id: "",
       name: "",
       base_url: "",
+      region: "global",
       upstream_model: canonical?.upstream_model || "",
       api_key: "",
       priority: strategy === "load-balance" ? 10 : strategy === "hybrid" ? (routes.length + index < 2 ? 10 : 20) : (routes.length + index + 1) * 10,
@@ -1196,6 +1407,7 @@ function ModelRouteWizard({ initialModelID, models, providers, credentials, onCl
         } else {
           payload.type = provider.type;
           payload.base_url = provider.base_url;
+          payload.region = provider.region;
           payload.authentication = provider.authentication;
           payload.api_key_header = provider.api_key_header;
           payload.allow_insecure_http = provider.allow_insecure_http || provider.base_url.startsWith("http://");
@@ -1217,6 +1429,7 @@ function ModelRouteWizard({ initialModelID, models, providers, credentials, onCl
           name: draft.name.trim(),
           type: "openai-compatible",
           base_url: draft.base_url.trim(),
+          region: draft.region,
           authentication: "bearer",
           api_key_header: "Authorization",
           allow_insecure_http: draft.allow_insecure_http,
@@ -1266,7 +1479,7 @@ function ModelRouteWizard({ initialModelID, models, providers, credentials, onCl
         {step === 3 && <section className="wizard-panel"><div className="wizard-panel-heading"><div><p className="section-eyebrow">{t("step")} 3</p><h3>{t("configureEndpoints")}</h3><p>{t("endpointHelp")}</p></div><button className="panel-action" type="button" onClick={addEndpoint}>{t("addCompatibleEndpoint")}</button></div>
           <div className="wizard-endpoints">
             {routes.map((route, index) => { const provider = providers.find((candidate) => candidate.id === route.provider); const policy = policies[route.provider] || { priority: route.priority, weight: route.weight }; return <article key={route.provider}><span className="route-order">{index + 1}</span><div className="wizard-endpoint-name"><strong>{provider?.name || route.provider}</strong><span>{t(provider?.official ? "official" : "thirdParty")} · {route.upstream_model}</span></div><label>{t("priority")}<input type="number" min="1" max="10000" value={policy.priority} onChange={(event) => setPolicies((current) => ({ ...current, [route.provider]: { ...policy, priority: Number(event.target.value) } }))} /></label><label>{t("weight")}<input type="number" min="1" max="10000" value={policy.weight} onChange={(event) => setPolicies((current) => ({ ...current, [route.provider]: { ...policy, weight: Number(event.target.value) } }))} /></label></article>; })}
-            {drafts.map((draft, index) => <article className="new-endpoint" key={index}><span className="route-order">{routes.length + index + 1}</span><div className="new-endpoint-fields"><label>{t("connectionId")}<input value={draft.id} placeholder="backup-provider" onChange={(event) => updateDraft(index, { id: event.target.value.toLowerCase() })} /></label><label>{t("displayName")}<input value={draft.name} placeholder="Backup provider" onChange={(event) => updateDraft(index, { name: event.target.value })} /></label><label className="wide">{t("baseUrl")}<input type="url" value={draft.base_url} placeholder="https://gateway.example.com/v1" onChange={(event) => updateDraft(index, { base_url: event.target.value })} /></label><label>{t("upstreamModelId")}<input value={draft.upstream_model} onChange={(event) => updateDraft(index, { upstream_model: event.target.value })} /></label><label>{t("apiKey")}<input type="password" value={draft.api_key} placeholder={t("optionalLocal")} onChange={(event) => updateDraft(index, { api_key: event.target.value })} /></label><label>{t("priority")}<input type="number" min="1" max="10000" value={draft.priority} onChange={(event) => updateDraft(index, { priority: Number(event.target.value) })} /></label><label>{t("weight")}<input type="number" min="1" max="10000" value={draft.weight} onChange={(event) => updateDraft(index, { weight: Number(event.target.value) })} /></label><label className="checkbox wide"><input type="checkbox" checked={draft.allow_insecure_http} onChange={(event) => updateDraft(index, { allow_insecure_http: event.target.checked })} />{t("allowLocalHttp")}</label></div><button className="remove-rule-member" type="button" onClick={() => setDrafts((current) => current.filter((_, draftIndex) => draftIndex !== index))}>{t("remove")}</button></article>)}
+            {drafts.map((draft, index) => <article className="new-endpoint" key={index}><span className="route-order">{routes.length + index + 1}</span><div className="new-endpoint-fields"><label>{t("connectionId")}<input value={draft.id} placeholder="backup-provider" onChange={(event) => updateDraft(index, { id: event.target.value.toLowerCase() })} /></label><label>{t("displayName")}<input value={draft.name} placeholder="Backup provider" onChange={(event) => updateDraft(index, { name: event.target.value })} /></label><label className="wide">{t("baseUrl")}<input type="url" value={draft.base_url} placeholder="https://gateway.example.com/v1" onChange={(event) => updateDraft(index, { base_url: event.target.value })} /></label><label>{t("endpointRegion")}<select value={draft.region} onChange={(event) => updateDraft(index, { region: event.target.value })}>{endpointRegionOptions.map((option) => <option key={option.value} value={option.value}>{t(option.label)}</option>)}</select></label><label>{t("upstreamModelId")}<input value={draft.upstream_model} onChange={(event) => updateDraft(index, { upstream_model: event.target.value })} /></label><label>{t("apiKey")}<input type="password" value={draft.api_key} placeholder={t("optionalLocal")} onChange={(event) => updateDraft(index, { api_key: event.target.value })} /></label><label>{t("priority")}<input type="number" min="1" max="10000" value={draft.priority} onChange={(event) => updateDraft(index, { priority: Number(event.target.value) })} /></label><label>{t("weight")}<input type="number" min="1" max="10000" value={draft.weight} onChange={(event) => updateDraft(index, { weight: Number(event.target.value) })} /></label><label className="checkbox wide"><input type="checkbox" checked={draft.allow_insecure_http} onChange={(event) => updateDraft(index, { allow_insecure_http: event.target.checked })} />{t("allowLocalHttp")}</label></div><button className="remove-rule-member" type="button" onClick={() => setDrafts((current) => current.filter((_, draftIndex) => draftIndex !== index))}>{t("remove")}</button></article>)}
           </div>
         </section>}
         {step === 4 && <section className="wizard-panel"><p className="section-eyebrow">{t("step")} 4</p><h3>{t("reviewRoute")}</h3><p>{t("reviewHelp")} <code>{modelID}</code></p><div className="route-review"><header><div><span>{t("publicModelId")}</span><strong>{modelID}</strong></div><span>{t(strategy === "load-balance" ? "loadBalance" : strategy)}</span></header><div className="route-review-chain">{orderedPreview.map((endpoint, index) => <article key={`${endpoint.id}-${index}`}><span className={index === 0 ? "is-primary" : ""}>{index === 0 ? "✓" : index + 1}</span><div><strong>{endpoint.label || endpoint.id}</strong><small>{endpoint.upstream}</small><p>{t("priority")} {endpoint.priority} · {t("weight")} {endpoint.weight} · {t(endpoint.existing ? "existing" : "newEndpoint")}</p></div></article>)}</div></div><p className="wizard-note">{t("automaticFailover")}</p></section>}
@@ -1340,27 +1553,37 @@ function RoutingRuleDialog({ rule, models, credentials, onClose, onSaved }: { ru
   </div>;
 }
 
-function CustomProviderWizard({ provider, credentials, onClose, onSaved }: { provider: Provider | null; credentials: AdminCredentials; onClose: () => void; onSaved: () => Promise<void> }) {
+function CustomProviderWizard({ provider, families, credentials, onClose, onSaved }: { provider: Provider | null; families: ModelFamily[]; credentials: AdminCredentials; onClose: () => void; onSaved: () => Promise<void> }) {
   const { t } = useI18n();
   const model = provider?.models?.[0];
   const initialCategory: "open-source" | "commercial" = provider?.model_category === "commercial" ? "commercial" : "open-source";
-  const initialFamily = model ? modelBrandKey(model) : modelFamiliesByCategory[initialCategory][0];
+  const catalogFamilies = useMemo(() => {
+    const source = families.length ? families : [...new Set(Object.values(modelFamiliesByCategory).flat())].map((id) => ({ id, name: modelFamilyLabels[id] || id, publisher: "", provider: "", capabilities: [], routeable: true }));
+    return [...source].sort((left, right) => left.publisher.localeCompare(right.publisher) || left.name.localeCompare(right.name));
+  }, [families]);
+  const initialCategoryFamilies = catalogFamilies.filter((family) => modelFamilyMatchesCategory(family, initialCategory));
+  const requestedInitialFamily = model ? modelBrandKey(model) : initialCategoryFamilies[0]?.id || "generic";
+  const initialFamilyRecord = initialCategoryFamilies.find((family) => family.id === requestedInitialFamily) || initialCategoryFamilies[0];
   const [stepIndex, setStepIndex] = useState(0);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [draft, setDraft] = useState({
     modelCategory: initialCategory,
-    modelFamily: modelFamiliesByCategory[initialCategory].includes(initialFamily) ? initialFamily : modelFamiliesByCategory[initialCategory][0],
+    modelPublisher: initialFamilyRecord?.publisher || "",
+    modelFamily: initialFamilyRecord?.id || "generic",
     id: provider?.id || "",
     name: provider?.name || "",
     type: provider?.type || "openai-compatible",
     authentication: provider?.authentication || "bearer",
     baseUrl: provider?.base_url || "",
+    region: normalizeEndpointRegion(provider?.region),
     apiKeyHeader: provider?.api_key_header || "Authorization",
     allowInsecureHttp: provider?.allow_insecure_http || provider?.base_url.startsWith("http://") || false,
     apiKey: "",
     publicModelId: model?.id || "",
     upstreamModelId: model?.upstream_model || "",
+    inputPrice: model?.pricing?.input_per_million || 0,
+    outputPrice: model?.pricing?.output_per_million || 0,
     priority: model?.priority || 100,
     weight: model?.weight || 100,
     capabilities: model?.capabilities || capabilityOptions.map((item) => item.value),
@@ -1368,6 +1591,9 @@ function CustomProviderWizard({ provider, credentials, onClose, onSaved }: { pro
     clearApiKey: false
   });
   const updateDraft = <K extends keyof typeof draft>(key: K, value: typeof draft[K]) => setDraft((current) => ({ ...current, [key]: value }));
+  const categoryFamilies = catalogFamilies.filter((family) => modelFamilyMatchesCategory(family, draft.modelCategory));
+  const modelPublishers = [...new Set(categoryFamilies.map((family) => family.publisher).filter(Boolean))];
+  const publisherFamilies = categoryFamilies.filter((family) => family.publisher === draft.modelPublisher);
   const steps: Array<{ title: MessageKey; description: MessageKey }> = [
     { title: "endpointWizardBasic", description: "endpointWizardBasicHelp" },
     { title: "endpointWizardConnection", description: "endpointWizardConnectionHelp" },
@@ -1392,6 +1618,7 @@ function CustomProviderWizard({ provider, credentials, onClose, onSaved }: { pro
     if (index === 2) {
       if (!draft.publicModelId.trim() || !draft.upstreamModelId.trim()) return t("validationRequiredFields");
       if (draft.priority < 1 || draft.priority > 10000 || draft.weight < 1 || draft.weight > 10000) return t("validationRouteRange");
+      if (draft.inputPrice < 0 || draft.outputPrice < 0) return t("validationPrice");
     }
     return "";
   };
@@ -1410,10 +1637,11 @@ function CustomProviderWizard({ provider, credentials, onClose, onSaved }: { pro
       id: draft.id.trim(), name: draft.name.trim(), enabled: draft.enabled,
       clear_api_key: draft.clearApiKey, model_category: draft.modelCategory,
       type: draft.type, base_url: draft.baseUrl.trim(), authentication: draft.authentication,
-      api_key_header: draft.apiKeyHeader.trim(), allow_insecure_http: draft.allowInsecureHttp,
+      api_key_header: draft.apiKeyHeader.trim(), region: draft.region, allow_insecure_http: draft.allowInsecureHttp,
       model: {
         id: draft.publicModelId.trim(), name: draft.publicModelId.trim(), family: draft.modelFamily,
         upstream_model: draft.upstreamModelId.trim(), capabilities: draft.capabilities,
+        input_price: draft.inputPrice, output_price: draft.outputPrice, currency: "USD",
         priority: draft.priority, weight: draft.weight
       }
     };
@@ -1421,6 +1649,13 @@ function CustomProviderWizard({ provider, credentials, onClose, onSaved }: { pro
     setBusy(true); setError("");
     try {
       await api<Provider>("/api/admin/providers", credentials, { method: "POST", body: JSON.stringify(payload) });
+      if (draft.apiKey.trim() || provider?.has_api_key) {
+        const probe = await api<{ valid: boolean; latency_ms: number; message?: string }>(`/api/admin/providers/${encodeURIComponent(draft.id.trim())}/validate`, credentials, { method: "POST" });
+        if (!probe.valid) {
+          setError(`${t("connectionSavedButTestFailed")} ${probe.message || ""}`.trim());
+          return;
+        }
+      }
       await onSaved();
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
     finally { setBusy(false); }
@@ -1435,8 +1670,11 @@ function CustomProviderWizard({ provider, credentials, onClose, onSaved }: { pro
       <div className="wizard-body endpoint-wizard-body">
         <div className="wizard-panel"><p className="section-eyebrow">{t("step")} {stepIndex + 1} / {steps.length}</p><h3>{t(steps[stepIndex].title)}</h3><p>{t(steps[stepIndex].description)}</p></div>
         {stepIndex === 0 && <div className="endpoint-wizard-grid">
-          <label>{t("modelType")}<select value={draft.modelCategory} onChange={(event) => { const category = event.target.value as "open-source" | "commercial"; updateDraft("modelCategory", category); updateDraft("modelFamily", modelFamiliesByCategory[category][0]); }}><option value="open-source">{t("openSourceCategory")}</option><option value="commercial">{t("commercialCategory")}</option></select>{example(t("openSourceCategory"))}</label>
-          <label>{t("modelFamily")}<select value={draft.modelFamily} onChange={(event) => updateDraft("modelFamily", event.target.value)}>{modelFamiliesByCategory[draft.modelCategory].map((family) => <option key={family} value={family}>{modelFamilyLabels[family] || family}</option>)}</select>{example("DeepSeek")}</label>
+          <div className="endpoint-wizard-taxonomy">
+            <label>{t("modelType")}<select value={draft.modelCategory} onChange={(event) => { const category = event.target.value as "open-source" | "commercial"; const firstFamily = catalogFamilies.find((family) => modelFamilyMatchesCategory(family, category)); setDraft((current) => ({ ...current, modelCategory: category, modelPublisher: firstFamily?.publisher || "", modelFamily: firstFamily?.id || "generic" })); }}><option value="open-source">{t("openSourceCategory")}</option><option value="commercial">{t("commercialCategory")}</option></select>{example(t(draft.modelCategory === "open-source" ? "openSourceCategory" : "commercialCategory"))}</label>
+            <label>{t("modelPublishers")}<select value={draft.modelPublisher} onChange={(event) => { const publisher = event.target.value; const firstFamily = categoryFamilies.find((family) => family.publisher === publisher); setDraft((current) => ({ ...current, modelPublisher: publisher, modelFamily: firstFamily?.id || "generic" })); }}>{modelPublishers.map((publisher) => <option key={publisher} value={publisher}>{publisher}</option>)}</select>{example("Alibaba")}</label>
+            <label>{t("modelFamily")}<select value={draft.modelFamily} onChange={(event) => updateDraft("modelFamily", event.target.value)}>{publisherFamilies.map((family) => <option key={`${family.publisher}:${family.id}`} value={family.id}>{family.name}</option>)}</select>{example("Qwen")}</label>
+          </div>
           <label>{t("connectionId")}<input value={draft.id} readOnly={Boolean(provider)} maxLength={63} placeholder="internal-gateway" onChange={(event) => updateDraft("id", event.target.value.toLowerCase())} />{example("modelhub-singapore")}</label>
           <label>{t("displayName")}<input value={draft.name} placeholder="Internal AI Gateway" onChange={(event) => updateDraft("name", event.target.value)} />{example("ModelHub Singapore")}</label>
         </div>}
@@ -1444,6 +1682,7 @@ function CustomProviderWizard({ provider, credentials, onClose, onSaved }: { pro
           <label>{t("protocol")}<select value={draft.type} onChange={(event) => updateDraft("type", event.target.value)}><option value="openai-compatible">{t("openAICompatible")}</option><option value="anthropic">{t("anthropicMessages")}</option></select>{example(t("openAICompatible"))}</label>
           <label>{t("authentication")}<select value={draft.authentication} onChange={(event) => { updateDraft("authentication", event.target.value); updateDraft("apiKeyHeader", event.target.value === "bearer" ? "Authorization" : event.target.value); }}><option value="bearer">{t("bearerToken")}</option><option value="x-api-key">x-api-key</option><option value="api-key">api-key</option></select>{example(t("bearerToken"))}</label>
           <label className="full">{t("baseUrl")}<input type="url" value={draft.baseUrl} placeholder={connectionExample} onChange={(event) => updateDraft("baseUrl", event.target.value)} />{example(connectionExample)}</label>
+          <label>{t("endpointRegion")}<select value={draft.region} onChange={(event) => updateDraft("region", event.target.value)}>{endpointRegionOptions.map((option) => <option key={option.value} value={option.value}>{t(option.label)}</option>)}</select>{example(`${t("regionAPAC")} · apac`)}</label>
           <label>{t("apiKeyHeader")}<input value={draft.apiKeyHeader} placeholder={headerExample} onChange={(event) => updateDraft("apiKeyHeader", event.target.value)} />{example(headerExample)}</label>
           <label>{t("providerApiKey")}<input type="password" autoComplete="new-password" value={draft.apiKey} placeholder={t("keepSavedKey")} onChange={(event) => updateDraft("apiKey", event.target.value)} />{example("sk-provider-••••••••")}</label>
           <label className="checkbox full"><input type="checkbox" checked={draft.allowInsecureHttp} onChange={(event) => updateDraft("allowInsecureHttp", event.target.checked)} /><span>{t("allowLocalHttp")}</span>{example("http://127.0.0.1:11434/v1")}</label>
@@ -1453,13 +1692,15 @@ function CustomProviderWizard({ provider, credentials, onClose, onSaved }: { pro
           <label>{t("upstreamModelId")}<input value={draft.upstreamModelId} placeholder="deepseek/deepseek-v4-flash" onChange={(event) => updateDraft("upstreamModelId", event.target.value)} />{example("deepseek/deepseek-v4-flash")}</label>
           <label>{t("routePriority")}<input type="number" min="1" max="10000" value={draft.priority} onChange={(event) => updateDraft("priority", Number(event.target.value))} />{example(t("priorityExample"))}</label>
           <label>{t("routeWeight")}<input type="number" min="1" max="10000" value={draft.weight} onChange={(event) => updateDraft("weight", Number(event.target.value))} />{example(t("weightExample"))}</label>
+          <label>{t("inputPrice")}<input type="number" min="0" step="0.0001" value={draft.inputPrice} onChange={(event) => updateDraft("inputPrice", Number(event.target.value))} />{example("USD 0.50 / 1M Token")}</label>
+          <label>{t("outputPrice")}<input type="number" min="0" step="0.0001" value={draft.outputPrice} onChange={(event) => updateDraft("outputPrice", Number(event.target.value))} />{example("USD 2.00 / 1M Token")}</label>
         </div>}
         {stepIndex === 3 && <div className="endpoint-wizard-review">
-          <dl><div><dt>{t("displayName")}</dt><dd>{draft.name} <code>{draft.id}</code></dd></div><div><dt>{t("baseUrl")}</dt><dd><code>{draft.baseUrl}</code></dd></div><div><dt>{t("publicModelId")}</dt><dd><code>{draft.publicModelId}</code></dd></div><div><dt>{t("upstreamModelId")}</dt><dd><code>{draft.upstreamModelId}</code></dd></div><div><dt>{t("routePolicy")}</dt><dd>{t("priority")} {draft.priority} · {t("weight")} {draft.weight}</dd></div></dl>
+          <dl><div><dt>{t("displayName")}</dt><dd>{draft.name} <code>{draft.id}</code></dd></div><div><dt>{t("baseUrl")}</dt><dd><code>{draft.baseUrl}</code></dd></div><div><dt>{t("endpointRegion")}</dt><dd>{endpointRegionLabel(draft.region, t)} <code>{draft.region}</code></dd></div><div><dt>{t("publicModelId")}</dt><dd><code>{draft.publicModelId}</code></dd></div><div><dt>{t("upstreamModelId")}</dt><dd><code>{draft.upstreamModelId}</code></dd></div><div><dt>{t("routePolicy")}</dt><dd>{t("priority")} {draft.priority} · {t("weight")} {draft.weight}</dd></div><div><dt>{t("endpointPricing")}</dt><dd>USD {draft.inputPrice.toFixed(4)} / {draft.outputPrice.toFixed(4)}</dd></div></dl>
           <fieldset className="capability-picker"><legend>{t("capabilities")}</legend><div>{capabilityOptions.map((capability) => <label className="capability-option" key={capability.value}><input type="checkbox" checked={draft.capabilities.includes(capability.value)} onChange={(event) => updateDraft("capabilities", event.target.checked ? [...draft.capabilities, capability.value] : draft.capabilities.filter((item) => item !== capability.value))} /><span>{t(capability.label)}</span></label>)}</div>{example(t("capabilitiesExample"))}</fieldset>
           <label className="checkbox review-toggle"><input type="checkbox" checked={draft.enabled} onChange={(event) => updateDraft("enabled", event.target.checked)} /><span>{t("enableConnection")}</span>{example(t("enableConnectionExample"))}</label>
           {provider?.has_api_key && <label className="checkbox review-toggle"><input type="checkbox" checked={draft.clearApiKey} onChange={(event) => updateDraft("clearApiKey", event.target.checked)} /><span>{t("removeSavedKey")}</span>{example(t("removeSavedKeyExample"))}</label>}
-          <p className="wizard-note">{t("saveDoesNotVerify")}</p>
+          <p className="wizard-note">{t("saveAndVerify")}</p>
         </div>}
       </div>
       <p className="form-error endpoint-wizard-error" role="alert">{error}</p>
@@ -1468,7 +1709,7 @@ function CustomProviderWizard({ provider, credentials, onClose, onSaved }: { pro
   </div>;
 }
 
-function ProviderDialog({ provider, credentials, onClose, onSaved }: { provider: Provider | null; credentials: AdminCredentials; onClose: () => void; onSaved: () => Promise<void> }) {
+function ProviderDialog({ provider, families, credentials, onClose, onSaved }: { provider: Provider | null; families: ModelFamily[]; credentials: AdminCredentials; onClose: () => void; onSaved: () => Promise<void> }) {
   const { t } = useI18n();
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1479,7 +1720,7 @@ function ProviderDialog({ provider, credentials, onClose, onSaved }: { provider:
   const initialFamily = model ? modelBrandKey(model) : modelFamiliesByCategory[initialCategory][0];
   const [modelFamily, setModelFamily] = useState(modelFamiliesByCategory[initialCategory].includes(initialFamily) ? initialFamily : modelFamiliesByCategory[initialCategory][0]);
 
-  if (!official) return <CustomProviderWizard provider={provider} credentials={credentials} onClose={onClose} onSaved={onSaved} />;
+  if (!official) return <CustomProviderWizard provider={provider} families={families} credentials={credentials} onClose={onClose} onSaved={onSaved} />;
 
   const changeModelCategory = (next: "open-source" | "commercial") => {
     setModelCategory(next);

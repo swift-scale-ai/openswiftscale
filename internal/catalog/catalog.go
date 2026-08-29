@@ -27,15 +27,21 @@ type ModelFamily struct {
 }
 
 type Provider struct {
-	ID              string `yaml:"id" json:"id"`
-	Type            string `yaml:"type" json:"type"`
-	BaseURL         string `yaml:"base_url" json:"base_url"`
-	ChatPath        string `yaml:"chat_path,omitempty" json:"chat_path,omitempty"`
-	ResponsesPath   string `yaml:"responses_path,omitempty" json:"responses_path,omitempty"`
-	EmbeddingsPath  string `yaml:"embeddings_path,omitempty" json:"embeddings_path,omitempty"`
-	Authentication  string `yaml:"authentication,omitempty" json:"authentication,omitempty"`
-	APIKeyHeader    string `yaml:"api_key_header,omitempty" json:"api_key_header,omitempty"`
-	APIKeyQueryName string `yaml:"api_key_query_name,omitempty" json:"api_key_query_name,omitempty"`
+	ID                 string `yaml:"id" json:"id"`
+	Type               string `yaml:"type" json:"type"`
+	BaseURL            string `yaml:"base_url" json:"base_url"`
+	ChatPath           string `yaml:"chat_path,omitempty" json:"chat_path,omitempty"`
+	ResponsesPath      string `yaml:"responses_path,omitempty" json:"responses_path,omitempty"`
+	EmbeddingsPath     string `yaml:"embeddings_path,omitempty" json:"embeddings_path,omitempty"`
+	ImagesPath         string `yaml:"images_path,omitempty" json:"images_path,omitempty"`
+	RerankPath         string `yaml:"rerank_path,omitempty" json:"rerank_path,omitempty"`
+	VideosPath         string `yaml:"videos_path,omitempty" json:"videos_path,omitempty"`
+	SpeechPath         string `yaml:"speech_path,omitempty" json:"speech_path,omitempty"`
+	TranscriptionsPath string `yaml:"transcriptions_path,omitempty" json:"transcriptions_path,omitempty"`
+	Authentication     string `yaml:"authentication,omitempty" json:"authentication,omitempty"`
+	APIKeyHeader       string `yaml:"api_key_header,omitempty" json:"api_key_header,omitempty"`
+	APIKeyQueryName    string `yaml:"api_key_query_name,omitempty" json:"api_key_query_name,omitempty"`
+	Region             string `yaml:"region,omitempty" json:"region,omitempty"`
 }
 
 type Model struct {
@@ -54,25 +60,20 @@ type Model struct {
 	Weight          int               `yaml:"weight,omitempty" json:"weight"`
 	RouteOrder      int               `yaml:"-" json:"route_order,omitempty"`
 	ManualRouting   bool              `yaml:"-" json:"-"`
+	RoutingMode     string            `yaml:"-" json:"routing_mode,omitempty"`
+	PreferredRegion string            `yaml:"-" json:"preferred_region,omitempty"`
+	SuccessCount    int64             `yaml:"-" json:"success_count,omitempty"`
+	FailureCount    int64             `yaml:"-" json:"failure_count,omitempty"`
+	LatencyEWMA     float64           `yaml:"-" json:"latency_ewma_ms,omitempty"`
+	LastStatus      int               `yaml:"-" json:"last_status,omitempty"`
+	LastCheckedAt   string            `yaml:"-" json:"last_checked_at,omitempty"`
+	PlatformScore   float64           `yaml:"-" json:"platform_score,omitempty"`
 }
 
 type Pricing struct {
 	InputPerMillion  float64 `yaml:"input_per_million" json:"input_per_million"`
 	OutputPerMillion float64 `yaml:"output_per_million" json:"output_per_million"`
 	Currency         string  `yaml:"currency" json:"currency"`
-}
-
-type RoutingRule struct {
-	ID      string              `json:"id"`
-	Name    string              `json:"name"`
-	Enabled bool                `json:"enabled"`
-	Members []RoutingRuleMember `json:"members"`
-}
-
-type RoutingRuleMember struct {
-	ModelID  string `json:"model_id"`
-	Priority int    `json:"priority"`
-	Weight   int    `json:"weight"`
 }
 
 func Load(path string) (*Catalog, error) {
@@ -97,20 +98,48 @@ func (c *Catalog) Validate() error {
 		p.ID = strings.ToLower(strings.TrimSpace(p.ID))
 		p.Type = strings.ToLower(strings.TrimSpace(p.Type))
 		p.BaseURL = strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")
+		p.Region = strings.ToLower(strings.TrimSpace(p.Region))
+		if p.Region == "" {
+			p.Region = "global"
+		}
+		switch p.Region {
+		case "global", "apac", "us", "europe", "local":
+		default:
+			return fmt.Errorf("catalog provider %q has unsupported region %q", p.ID, p.Region)
+		}
 		if p.ID == "" || p.BaseURL == "" {
 			return fmt.Errorf("catalog provider id and base_url are required")
 		}
 		if p.Type == "" {
 			p.Type = "openai-compatible"
 		}
+		endpointPrefix := "/v1"
+		if strings.HasSuffix(p.BaseURL, "/v1") || (p.ChatPath != "" && !strings.HasPrefix(p.ChatPath, "/v1/")) {
+			endpointPrefix = ""
+		}
 		if p.ChatPath == "" {
-			p.ChatPath = "/v1/chat/completions"
+			p.ChatPath = endpointPrefix + "/chat/completions"
 		}
 		if p.ResponsesPath == "" {
-			p.ResponsesPath = "/v1/responses"
+			p.ResponsesPath = endpointPrefix + "/responses"
 		}
 		if p.EmbeddingsPath == "" {
-			p.EmbeddingsPath = "/v1/embeddings"
+			p.EmbeddingsPath = endpointPrefix + "/embeddings"
+		}
+		if p.ImagesPath == "" {
+			p.ImagesPath = endpointPrefix + "/images/generations"
+		}
+		if p.RerankPath == "" {
+			p.RerankPath = endpointPrefix + "/rerank"
+		}
+		if p.VideosPath == "" {
+			p.VideosPath = endpointPrefix + "/videos"
+		}
+		if p.SpeechPath == "" {
+			p.SpeechPath = endpointPrefix + "/audio/speech"
+		}
+		if p.TranscriptionsPath == "" {
+			p.TranscriptionsPath = endpointPrefix + "/audio/transcriptions"
 		}
 		providers[p.ID] = true
 	}

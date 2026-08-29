@@ -6,6 +6,15 @@ OpenSwiftScale is a free, open-source, self-hosted AI gateway for individual dev
 
 OpenSwiftScale is an independent product and brand. It does not require a hosted account, license server, external control plane, or mandatory telemetry.
 
+## Product forms
+
+OpenSwiftScale has two product forms:
+
+- **Open-source self-hosted:** a compact gateway operated by the developer on infrastructure they control.
+- **OpenSwiftScale Cloud:** a managed service with hosted accounts, billing, and platform-operated endpoints.
+
+There is no OpenSwiftScale Enterprise or Dedicated edition. Organization governance and private deployment platform features belong outside the OpenSwiftScale product line so the open-source and Cloud experiences can remain small, consistent, and developer-focused.
+
 ## Design principles
 
 1. **Useful in three minutes.** Install, add one provider key, create one Gateway API key, test, and finish.
@@ -23,14 +32,14 @@ OpenSwiftScale is an independent product and brand. It does not require a hosted
 - Small product teams that need one inexpensive internal AI endpoint.
 - Developers who want to understand exactly which provider endpoint served a request.
 
-Enterprise governance, organization hierarchies, SSO/SCIM, approval workflows, and fleet management are intentionally outside this product.
+Organization hierarchies, SSO/SCIM, approval workflows, compliance suites, and fleet management are intentionally outside this product.
 
 ## Open-source scope
 
 - Direct provider connections and BYOK.
 - A model catalog organized by publisher, family, exact model ID, and endpoint.
 - Same-model endpoint ordering and failover with no cross-model substitution.
-- OpenAI-compatible chat, responses, embeddings, and model discovery.
+- Unified chat, responses, embeddings, image generation, reranking, video generation, speech synthesis, transcription, and model discovery APIs.
 - Streaming, tool calls, structured-output pass-through, and provider error handling.
 - Independently revocable, hash-only Gateway API keys and separate administrator authentication.
 - Local request metadata, Token usage, estimated cost, latency, and serving endpoint.
@@ -42,7 +51,7 @@ Enterprise governance, organization hierarchies, SSO/SCIM, approval workflows, a
 
 - Semantic task classification or automatic model selection.
 - Virtual model aliases that route across different model IDs.
-- Enterprise identity, policy, compliance, or multi-organization administration.
+- Organization-wide identity, policy, compliance, or multi-organization administration.
 - Acting as a model reseller or credit wallet in the self-hosted edition.
 - Depending on OpenRouter or another model aggregator.
 - Storing prompts or responses by default.

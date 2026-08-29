@@ -115,7 +115,7 @@ func TestInferenceAndUsage(t *testing.T) {
 	adminRequest.SetBasicAuth("admin", "management-key")
 	adminResponse := httptest.NewRecorder()
 	app.ServeHTTP(adminResponse, adminRequest)
-	if adminResponse.Code != http.StatusOK || !strings.Contains(adminResponse.Body.String(), `"requests":1`) {
+	if adminResponse.Code != http.StatusOK || !strings.Contains(adminResponse.Body.String(), `"requests":1`) || !strings.Contains(adminResponse.Body.String(), `"pagination":{"limit":100,"offset":0,"total":1}`) {
 		t.Fatalf("unexpected usage response: status=%d body=%s", adminResponse.Code, adminResponse.Body.String())
 	}
 
@@ -139,8 +139,63 @@ func TestInferenceAndUsage(t *testing.T) {
 	rulesRequest.SetBasicAuth("admin", "management-key")
 	rulesResponse := httptest.NewRecorder()
 	app.ServeHTTP(rulesResponse, rulesRequest)
-	if rulesResponse.Code != http.StatusOK || strings.TrimSpace(rulesResponse.Body.String()) != "[]" {
-		t.Fatalf("empty routing rules must be returned as an array: status=%d body=%s", rulesResponse.Code, rulesResponse.Body.String())
+	if rulesResponse.Code != http.StatusNotFound {
+		t.Fatalf("legacy routing rules API must not remain exposed: status=%d body=%s", rulesResponse.Code, rulesResponse.Body.String())
+	}
+}
+
+func TestMultimodalInferenceEndpoints(t *testing.T) {
+	tests := []struct {
+		path, endpoint, capability, providerPath string
+	}{
+		{"/v1/images/generations", "image", "image", "/v1/images/generations"},
+		{"/v1/rerank", "rerank", "rerank", "/v1/rerank"},
+		{"/v1/videos", "video", "video", "/v1/videos"},
+		{"/v1/audio/speech", "speech", "speech", "/v1/audio/speech"},
+	}
+	for _, test := range tests {
+		t.Run(test.endpoint, func(t *testing.T) {
+			providerConfig := catalog.Provider{ID: "mock", Type: "openai-compatible", BaseURL: "https://provider.example"}
+			switch test.endpoint {
+			case "image":
+				providerConfig.ImagesPath = test.providerPath
+			case "rerank":
+				providerConfig.RerankPath = test.providerPath
+			case "video":
+				providerConfig.VideosPath = test.providerPath
+			case "speech":
+				providerConfig.SpeechPath = test.providerPath
+			}
+			c := &catalog.Catalog{Providers: []catalog.Provider{providerConfig}, Models: []catalog.Model{{ID: "public-model", Name: "Public Model", Provider: "mock", UpstreamModel: "upstream-model", Capabilities: []string{test.capability}}}}
+			if err := c.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			database, err := store.Open(filepath.Join(t.TempDir(), "multimodal.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			client := &http.Client{Transport: gatewayRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path != test.providerPath {
+					t.Fatalf("unexpected provider path: %s", r.URL.Path)
+				}
+				payload, _ := io.ReadAll(r.Body)
+				if !strings.Contains(string(payload), `"model":"upstream-model"`) {
+					t.Fatalf("model was not rewritten: %s", payload)
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"ok":true}`)), Request: r}, nil
+			})}
+			cfg := config.Config{APIKeys: []string{"client-key"}, AdminUsername: "admin", AdminPassword: "password", RateLimitRPM: 10, Concurrency: 2, MaxBodyBytes: 1 << 20}
+			app := New(cfg, c, auth.New(cfg.APIKeys, false), router.New(c, map[string]string{"mock": "provider-key"}), provider.NewClient(client), database, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler()
+			request := httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(`{"model":"public-model"}`))
+			request.Header.Set("Authorization", "Bearer client-key")
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			app.ServeHTTP(response, request)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
 	}
 }
 
@@ -170,7 +225,13 @@ func TestProviderCanBeConfiguredWithoutStartupValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := config.Config{APIKeys: []string{"client-key"}, AdminUsername: "admin", AdminPassword: "management-key", PublicURL: "http://192.168.1.25:8080", RateLimitRPM: 10, Concurrency: 2, MaxBodyBytes: 1 << 20}
-	app := New(cfg, runtimeCatalog, auth.New(cfg.APIKeys, false), router.New(runtimeCatalog, keys), provider.NewClient(nil), database, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler()
+	probeHTTPClient := &http.Client{Transport: gatewayRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodGet || !strings.HasSuffix(request.URL.Path, "/v1/models") || request.Header.Get("Authorization") != "Bearer provider-secret" {
+			t.Fatalf("unexpected provider probe: %s %s auth=%q", request.Method, request.URL.Path, request.Header.Get("Authorization"))
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"data":[]}`)), Request: request}, nil
+	})}
+	app := New(cfg, runtimeCatalog, auth.New(cfg.APIKeys, false), router.New(runtimeCatalog, keys), provider.NewClient(probeHTTPClient), database, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler()
 
 	request := httptest.NewRequest(http.MethodPost, "/api/admin/providers", strings.NewReader(`{"id":"official","api_key":"provider-secret"}`))
 	request.SetBasicAuth("admin", "management-key")
@@ -191,31 +252,21 @@ func TestProviderCanBeConfiguredWithoutStartupValidation(t *testing.T) {
 	statusRequest.SetBasicAuth("admin", "management-key")
 	statusResponse := httptest.NewRecorder()
 	app.ServeHTTP(statusResponse, statusRequest)
-	if statusResponse.Code != http.StatusOK || !strings.Contains(statusResponse.Body.String(), `"api_base_url":"http://192.168.1.25:8080/v1"`) {
+	if statusResponse.Code != http.StatusOK || !strings.Contains(statusResponse.Body.String(), `"api_base_url":"http://192.168.1.25:8080/v1"`) || !strings.Contains(statusResponse.Body.String(), `"local_api_base_url":"http://127.0.0.1:8080/v1"`) || !strings.Contains(statusResponse.Body.String(), `"lan_api_base_url":"http://192.168.1.25:8080/v1"`) {
 		t.Fatalf("status did not expose configured API base URL: status=%d body=%s", statusResponse.Code, statusResponse.Body.String())
 	}
+	probeRequest := httptest.NewRequest(http.MethodPost, "/api/admin/providers/official/validate", nil)
+	probeRequest.SetBasicAuth("admin", "management-key")
+	probeResponse := httptest.NewRecorder()
+	app.ServeHTTP(probeResponse, probeRequest)
+	if probeResponse.Code != http.StatusOK || !strings.Contains(probeResponse.Body.String(), `"valid":true`) {
+		t.Fatalf("active provider validation failed: status=%d body=%s", probeResponse.Code, probeResponse.Body.String())
+	}
+	validated, found, err := database.Provider(context.Background(), "official")
+	if err != nil || !found || validated.ValidationStatus != "valid" {
+		t.Fatalf("provider validation was not persisted: %#v found=%v err=%v", validated, found, err)
+	}
 
-	policyRequest := httptest.NewRequest(http.MethodPost, "/api/admin/model-route-policies", strings.NewReader(`{"model_id":"model","strategy":"failover"}`))
-	policyRequest.SetBasicAuth("admin", "management-key")
-	policyResponse := httptest.NewRecorder()
-	app.ServeHTTP(policyResponse, policyRequest)
-	if policyResponse.Code != http.StatusOK || !strings.Contains(policyResponse.Body.String(), `"strategy":"failover"`) {
-		t.Fatalf("model route policy was not saved: status=%d body=%s", policyResponse.Code, policyResponse.Body.String())
-	}
-	listRequest := httptest.NewRequest(http.MethodGet, "/api/admin/model-route-policies", nil)
-	listRequest.SetBasicAuth("admin", "management-key")
-	listResponse := httptest.NewRecorder()
-	app.ServeHTTP(listResponse, listRequest)
-	if listResponse.Code != http.StatusOK || !strings.Contains(listResponse.Body.String(), `"model_id":"model"`) {
-		t.Fatalf("model route policy was not listed: status=%d body=%s", listResponse.Code, listResponse.Body.String())
-	}
-	deleteRequest := httptest.NewRequest(http.MethodDelete, "/api/admin/model-route-policies/model", nil)
-	deleteRequest.SetBasicAuth("admin", "management-key")
-	deleteResponse := httptest.NewRecorder()
-	app.ServeHTTP(deleteResponse, deleteRequest)
-	if deleteResponse.Code != http.StatusNoContent {
-		t.Fatalf("model route policy was not deleted: status=%d body=%s", deleteResponse.Code, deleteResponse.Body.String())
-	}
 }
 
 func TestNormalizeModelCapabilities(t *testing.T) {
@@ -230,12 +281,19 @@ func TestNormalizeModelCapabilities(t *testing.T) {
 		t.Fatalf("unexpected default route policy: %#v", model)
 	}
 
-	model, err = normalizeModelInput(modelInput{ID: "custom-model", UpstreamModel: "upstream-model", Capabilities: []string{" Chat ", "chat", "responses"}}, "custom-provider")
+	model, err = normalizeModelInput(modelInput{ID: "custom-model", UpstreamModel: "upstream-model", Capabilities: []string{" Chat ", "chat", "responses"}, InputPrice: 0.5, OutputPrice: 2, Currency: "usd"}, "custom-provider")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(model.Capabilities) != 2 || model.Capabilities[0] != "chat" || model.Capabilities[1] != "responses" {
 		t.Fatalf("capabilities were not normalized: %#v", model.Capabilities)
+	}
+	if model.Pricing.InputPerMillion != 0.5 || model.Pricing.OutputPerMillion != 2 || model.Pricing.Currency != "USD" {
+		t.Fatalf("endpoint pricing was not normalized: %#v", model.Pricing)
+	}
+	model, err = normalizeModelInput(modelInput{ID: "media-model", UpstreamModel: "upstream-media", Capabilities: []string{"image", "rerank", "video", "speech", "transcription"}}, "custom-provider")
+	if err != nil || len(model.Capabilities) != 5 {
+		t.Fatalf("multimodal capabilities were rejected: %#v %v", model.Capabilities, err)
 	}
 
 	if _, err := normalizeModelInput(modelInput{ID: "custom-model", UpstreamModel: "upstream-model", Capabilities: []string{"unknown"}}, "custom-provider"); err == nil {
@@ -243,6 +301,9 @@ func TestNormalizeModelCapabilities(t *testing.T) {
 	}
 	if _, err := normalizeModelInput(modelInput{ID: "custom-model", UpstreamModel: "upstream-model", Priority: -1}, "custom-provider"); err == nil {
 		t.Fatal("expected an invalid priority to be rejected")
+	}
+	if _, err := normalizeModelInput(modelInput{ID: "custom-model", UpstreamModel: "upstream-model", InputPrice: -1}, "custom-provider"); err == nil {
+		t.Fatal("expected a negative price to be rejected")
 	}
 	priority, weight, err := normalizeRoutePolicy(0, 0)
 	if err != nil || priority != 100 || weight != 100 {
@@ -291,7 +352,7 @@ func TestInferenceFailsOverBetweenRoutesForSamePublicModel(t *testing.T) {
 	}
 }
 
-func TestRoutingRuleAPIRefreshesRuntimeRouter(t *testing.T) {
+func TestLegacyRoutingRuleAPIIsNotExposed(t *testing.T) {
 	c := &catalog.Catalog{
 		Providers: []catalog.Provider{{ID: "provider", Type: "openai-compatible", BaseURL: "https://provider.example"}},
 		Models: []catalog.Model{
@@ -334,12 +395,8 @@ func TestRoutingRuleAPIRefreshesRuntimeRouter(t *testing.T) {
 	request.SetBasicAuth("admin", "password")
 	response := httptest.NewRecorder()
 	app.ServeHTTP(response, request)
-	if response.Code != http.StatusOK {
-		t.Fatalf("save routing rule failed: status=%d body=%s", response.Code, response.Body.String())
-	}
-	routes, err := runtimeRouter.Resolve("smart-chat", "chat")
-	if err != nil || len(routes) != 2 || routes[0].Model.ID != "model-one" {
-		t.Fatalf("runtime router was not refreshed: %#v %v", routes, err)
+	if response.Code != http.StatusMethodNotAllowed && response.Code != http.StatusNotFound {
+		t.Fatalf("legacy routing rule API must not remain exposed: status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 

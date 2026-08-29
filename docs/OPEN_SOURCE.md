@@ -4,7 +4,7 @@ OpenSwiftScale is free and open-source software licensed under the Apache Licens
 
 ## What the license permits
 
-Subject to the full [Apache License 2.0](../LICENSE), users may use, reproduce, modify, distribute, and create derivative works from the Community source, including for commercial and internal purposes. The license also includes the patent grant and redistribution conditions stated in the license text.
+Subject to the full [Apache License 2.0](../LICENSE), users may use, reproduce, modify, distribute, and create derivative works from the source, including for commercial and internal purposes. The license also includes the patent grant and redistribution conditions stated in the license text.
 
 This document is explanatory and does not replace the license.
 

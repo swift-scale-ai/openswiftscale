@@ -1,9 +1,11 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +14,43 @@ import (
 	"github.com/swift-scale-ai/OpenSwiftScale/internal/catalog"
 	"github.com/swift-scale-ai/OpenSwiftScale/internal/router"
 )
+
+func TestTranscriptionMultipartRewritesModelAndPreservesFile(t *testing.T) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/v1/audio/transcriptions" {
+			t.Fatalf("unexpected transcription path: %s", r.URL.Path)
+		}
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Fatal(err)
+		}
+		if got := r.FormValue("model"); got != "upstream-transcriber" {
+			t.Fatalf("model was not rewritten: %q", got)
+		}
+		file, _, err := r.FormFile("file")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		payload, _ := io.ReadAll(file)
+		if string(payload) != "audio-bytes" {
+			t.Fatalf("file was not preserved: %q", payload)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"text":"hello"}`)), Request: r}, nil
+	})
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	_ = writer.WriteField("model", "public-transcriber")
+	file, _ := writer.CreateFormFile("file", "sample.wav")
+	_, _ = file.Write([]byte("audio-bytes"))
+	_ = writer.Close()
+	route := router.Route{Provider: catalog.Provider{ID: "example", Type: "openai-compatible", BaseURL: "https://provider.example", TranscriptionsPath: "/v1/audio/transcriptions"}, Model: catalog.Model{ID: "public-transcriber", UpstreamModel: "upstream-transcriber"}, APIKey: "provider-key"}
+	client := NewClient(&http.Client{Transport: transport})
+	response, err := client.Do(context.Background(), "transcription", route, body.Bytes(), http.Header{"Content-Type": []string{writer.FormDataContentType()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+}
 
 func TestOpenAICompatibleRequestAndUsage(t *testing.T) {
 	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {

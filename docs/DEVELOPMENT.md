@@ -51,7 +51,7 @@ The frontend production build is written to `internal/webui/dist` and embedded i
 | --- | --- |
 | `cmd/openswiftscale` | Process entry point and healthcheck command. |
 | `internal/gateway` | HTTP routing, authentication orchestration, management API, and inference proxy. |
-| `internal/router` | Priority, weight, failover, and alias resolution. |
+| `internal/router` | Exact-model priority, weight, platform scoring, and failover resolution. |
 | `internal/provider` | Upstream HTTP and protocol adapters. |
 | `internal/store` | SQLite schema, configuration, API users, keys, and usage records. |
 | `internal/secret` | Master-key handling and provider-credential encryption. |

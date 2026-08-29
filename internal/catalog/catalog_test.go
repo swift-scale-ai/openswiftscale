@@ -19,6 +19,19 @@ func TestValidateCatalog(t *testing.T) {
 	}
 }
 
+func TestDefaultEndpointPathsRespectVersionedBaseURL(t *testing.T) {
+	c := Catalog{Providers: []Provider{{ID: "root", BaseURL: "https://root.example"}, {ID: "versioned", BaseURL: "https://versioned.example/v1"}}}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Providers[0].ImagesPath != "/v1/images/generations" || c.Providers[0].TranscriptionsPath != "/v1/audio/transcriptions" {
+		t.Fatalf("unexpected root paths: %#v", c.Providers[0])
+	}
+	if c.Providers[1].ImagesPath != "/images/generations" || c.Providers[1].TranscriptionsPath != "/audio/transcriptions" {
+		t.Fatalf("versioned base URL duplicated /v1: %#v", c.Providers[1])
+	}
+}
+
 func TestBundledCatalogContainsPublishedFamilies(t *testing.T) {
 	c, err := Load("../../config/catalog.yaml")
 	if err != nil {

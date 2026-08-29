@@ -10,7 +10,7 @@ The standard installer detects the gateway host's active LAN address. The result
 http://192.168.1.25:8080/v1
 ```
 
-Use the console's **Overview → Gateway API** card to copy the address of the current instance. `127.0.0.1` and `localhost` are reachable only from the gateway host and are not shown as the internal API address. Production environments should normally configure the private DNS name or internal load-balancer address that exposes OpenSwiftScale, for example:
+Use **Console → API access → API access method** to switch between and copy the local and LAN addresses of the current instance. `127.0.0.1` and `localhost` are reachable only from the gateway host. Production environments should normally configure the private DNS name or internal load-balancer address that exposes OpenSwiftScale, for example:
 
 ```text
 https://ai-gateway.internal.example.com/v1
@@ -38,15 +38,23 @@ Create normal client credentials in **Console → API access**. Create one API u
 | `POST` | `/v1/chat/completions` | OpenAI-compatible chat completions, including SSE streaming. |
 | `POST` | `/v1/responses` | OpenAI Responses-compatible requests for supported providers. |
 | `POST` | `/v1/embeddings` | Embeddings for routes that advertise embedding capability. |
+| `POST` | `/v1/images/generations` | Image generation for routes that advertise image capability. |
+| `POST` | `/v1/rerank` | Document reranking for routes that advertise rerank capability. |
+| `POST` | `/v1/videos` | Video generation jobs for routes that advertise video capability. |
+| `POST` | `/v1/audio/speech` | Text-to-speech for routes that advertise speech capability. |
+| `POST` | `/v1/audio/transcriptions` | Multipart audio transcription for routes that advertise transcription capability. |
+
+All inference endpoints route only within the exact public `model` ID supplied by the caller. JSON endpoints accept `model` in the request body. Audio transcription accepts `multipart/form-data` with a `model` field and a `file` field. OpenSwiftScale rewrites the public model ID to the selected endpoint's upstream model ID while preserving the remaining request payload.
 
 Health endpoints do not use inference authentication: `GET /healthz` reports process health and `GET /readyz` reports readiness. Administrator endpoints under `/api/admin/*` are intended for the embedded console and use separate HTTP Basic authentication. API-user and key management is available through `/api/admin/users`; it never returns a previously created plaintext key.
 
 ## Discover available models
 
 ```bash
+export OPENSWIFTSCALE_URL="http://192.168.1.25:8080/v1"
 export OPEN_SWIFT_SCALE_KEY="<key-created-in-api-access>"
 
-curl http://192.168.1.25:8080/v1/models \
+curl "$OPENSWIFTSCALE_URL/models" \
   -H "Authorization: Bearer $OPEN_SWIFT_SCALE_KEY"
 ```
 
@@ -168,6 +176,78 @@ println!("{}", response.text().await?);
 
 Use the console-generated examples when possible: they automatically use the current `OPENSWIFTSCALE_PUBLIC_URL` and selected callable model ID.
 
+## Examples by model capability
+
+The provider must advertise the requested capability for the selected exact model ID. These request bodies are compatible gateway contracts; provider-specific optional fields are passed through when supported.
+
+### Responses API
+
+```bash
+curl "$OPENSWIFTSCALE_URL/responses" \
+  -H "Authorization: Bearer $OPEN_SWIFT_SCALE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"your-text-model-id","input":"Explain exact-model routing."}'
+```
+
+### Embeddings
+
+```bash
+curl "$OPENSWIFTSCALE_URL/embeddings" \
+  -H "Authorization: Bearer $OPEN_SWIFT_SCALE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"your-embedding-model-id","input":"OpenSwiftScale keeps routing transparent."}'
+```
+
+### Image generation
+
+```bash
+curl "$OPENSWIFTSCALE_URL/images/generations" \
+  -H "Authorization: Bearer $OPEN_SWIFT_SCALE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"your-image-model-id","prompt":"A transparent AI gateway","size":"1024x1024"}'
+```
+
+### Reranking
+
+```bash
+curl "$OPENSWIFTSCALE_URL/rerank" \
+  -H "Authorization: Bearer $OPEN_SWIFT_SCALE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"your-rerank-model-id","query":"transparent AI routing","documents":["Exact-model endpoint routing","An unrelated document"]}'
+```
+
+### Video generation
+
+```bash
+curl "$OPENSWIFTSCALE_URL/videos" \
+  -H "Authorization: Bearer $OPEN_SWIFT_SCALE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"your-video-model-id","prompt":"Requests flowing through a transparent AI gateway"}'
+```
+
+Video providers commonly return an asynchronous job rather than completed media. OpenSwiftScale passes the provider response through; poll or retrieve the job according to that provider's contract.
+
+### Speech synthesis
+
+```bash
+curl "$OPENSWIFTSCALE_URL/audio/speech" \
+  -H "Authorization: Bearer $OPEN_SWIFT_SCALE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"your-speech-model-id","input":"Hello from OpenSwiftScale.","voice":"default","response_format":"mp3"}' \
+  --output speech.mp3
+```
+
+### Audio transcription
+
+```bash
+curl "$OPENSWIFTSCALE_URL/audio/transcriptions" \
+  -H "Authorization: Bearer $OPEN_SWIFT_SCALE_KEY" \
+  -F "model=your-transcription-model-id" \
+  -F "file=@audio.wav"
+```
+
+The console includes the same capabilities for cURL, Python, Go, Java, Rust, and Node.js. Select one language to view all supported request types vertically.
+
 ## Routing behavior
 
 The request's `model` value is the Public Model ID. OpenSwiftScale resolves its configured endpoint pool as follows:
@@ -182,7 +262,7 @@ Successful inference responses identify the selected route with these headers:
 - `X-OpenSwiftScale-Provider`
 - `X-OpenSwiftScale-Route-Priority`
 
-See [Configuration](CONFIGURATION.md#same-model-endpoint-routing) for endpoint ordering and failover details. Cross-model alias headers may still appear for installations carrying deprecated compatibility rules; new configurations should not depend on them.
+See [Configuration](CONFIGURATION.md#same-model-endpoint-routing) for endpoint ordering, transparent platform scoring, and failover details. Routing is always limited to endpoints serving the requested exact model ID.
 
 ## Errors and request limits
 

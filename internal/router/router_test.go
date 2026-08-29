@@ -38,6 +38,18 @@ func TestCapabilityMismatch(t *testing.T) {
 	}
 }
 
+func TestEndpointCapabilityAliases(t *testing.T) {
+	for endpoint, advertised := range map[string]string{"rerank": "retrieval", "transcription": "asr", "speech": "tts"} {
+		c := &catalog.Catalog{Providers: []catalog.Provider{{ID: "p", BaseURL: "https://provider.example"}}, Models: []catalog.Model{{ID: "m", Provider: "p", UpstreamModel: "upstream", Capabilities: []string{advertised}}}}
+		if err := c.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := New(c, map[string]string{"p": "key"}).Resolve("m", endpoint); err != nil {
+			t.Fatalf("%s should accept %s capability: %v", endpoint, advertised, err)
+		}
+	}
+}
+
 func TestCatalogClonePreservesPublishedFamilies(t *testing.T) {
 	c := &catalog.Catalog{
 		Providers: []catalog.Provider{{ID: "p", BaseURL: "https://p"}},
@@ -73,6 +85,26 @@ func TestResolveOrdersRoutesByPriority(t *testing.T) {
 	}
 }
 
+func TestPlatformScoreOrdersSameModelEndpoints(t *testing.T) {
+	c := &catalog.Catalog{
+		Providers: []catalog.Provider{{ID: "expensive", BaseURL: "https://expensive"}, {ID: "efficient", BaseURL: "https://efficient"}},
+		Models: []catalog.Model{
+			{ID: "shared", Provider: "expensive", UpstreamModel: "m", Capabilities: []string{"chat"}, Priority: 10, PlatformScore: 55},
+			{ID: "shared", Provider: "efficient", UpstreamModel: "m", Capabilities: []string{"chat"}, Priority: 200, PlatformScore: 92},
+		},
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	routes, err := New(c, map[string]string{"expensive": "key", "efficient": "key"}).Resolve("shared", "chat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 2 || routes[0].Provider.ID != "efficient" {
+		t.Fatalf("platform score was not used: %#v", routes)
+	}
+}
+
 func TestResolveDistributesEqualPriorityByWeight(t *testing.T) {
 	c := &catalog.Catalog{
 		Providers: []catalog.Provider{{ID: "a", BaseURL: "https://a"}, {ID: "b", BaseURL: "https://b"}},
@@ -98,12 +130,35 @@ func TestResolveDistributesEqualPriorityByWeight(t *testing.T) {
 	}
 }
 
-func TestManualRoutingUsesWeightAcrossDraggedOrder(t *testing.T) {
+func TestFailoverModeUsesDraggedOrder(t *testing.T) {
 	c := &catalog.Catalog{
 		Providers: []catalog.Provider{{ID: "a", BaseURL: "https://a"}, {ID: "b", BaseURL: "https://b"}},
 		Models: []catalog.Model{
-			{ID: "shared", Provider: "a", UpstreamModel: "a", Capabilities: []string{"chat"}, Priority: 10, RouteOrder: 10, Weight: 3, ManualRouting: true},
-			{ID: "shared", Provider: "b", UpstreamModel: "b", Capabilities: []string{"chat"}, Priority: 20, RouteOrder: 20, Weight: 1, ManualRouting: true},
+			{ID: "shared", Provider: "a", UpstreamModel: "a", Capabilities: []string{"chat"}, Priority: 10, RouteOrder: 10, Weight: 100, ManualRouting: true, RoutingMode: "failover"},
+			{ID: "shared", Provider: "b", UpstreamModel: "b", Capabilities: []string{"chat"}, Priority: 20, RouteOrder: 20, Weight: 100, ManualRouting: true, RoutingMode: "failover"},
+		},
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	r := New(c, map[string]string{"a": "key", "b": "key"})
+	for range 4 {
+		routes, err := r.Resolve("shared", "chat")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if routes[0].Provider.ID != "a" || routes[1].Provider.ID != "b" {
+			t.Fatalf("failover order changed: %#v", routes)
+		}
+	}
+}
+
+func TestWeightedModeDistributesTrafficAndRetainsFailoverCandidates(t *testing.T) {
+	c := &catalog.Catalog{
+		Providers: []catalog.Provider{{ID: "a", BaseURL: "https://a"}, {ID: "b", BaseURL: "https://b"}},
+		Models: []catalog.Model{
+			{ID: "shared", Provider: "a", UpstreamModel: "a", Capabilities: []string{"chat"}, Priority: 100, Weight: 7, RoutingMode: "weighted"},
+			{ID: "shared", Provider: "b", UpstreamModel: "b", Capabilities: []string{"chat"}, Priority: 100, Weight: 3, RoutingMode: "weighted"},
 		},
 	}
 	if err := c.Validate(); err != nil {
@@ -111,15 +166,18 @@ func TestManualRoutingUsesWeightAcrossDraggedOrder(t *testing.T) {
 	}
 	r := New(c, map[string]string{"a": "key", "b": "key"})
 	selected := map[string]int{}
-	for range 4 {
+	for range 10 {
 		routes, err := r.Resolve("shared", "chat")
 		if err != nil {
 			t.Fatal(err)
 		}
+		if len(routes) != 2 {
+			t.Fatalf("weighted route dropped failover candidate: %#v", routes)
+		}
 		selected[routes[0].Provider.ID]++
 	}
-	if selected["a"] != 3 || selected["b"] != 1 {
-		t.Fatalf("manual route weights were not applied across the dragged order: %#v", selected)
+	if selected["a"] != 7 || selected["b"] != 3 {
+		t.Fatalf("unexpected weighted distribution: %#v", selected)
 	}
 }
 
@@ -140,56 +198,5 @@ func TestResolveSkipsUnconfiguredHigherPriorityRoute(t *testing.T) {
 	}
 	if len(routes) != 1 || routes[0].Provider.ID != "secondary" {
 		t.Fatalf("unexpected routes: %#v", routes)
-	}
-}
-
-func TestResolveCrossModelRoutingRuleByPriority(t *testing.T) {
-	c := &catalog.Catalog{
-		Providers: []catalog.Provider{{ID: "one", BaseURL: "https://one"}, {ID: "two", BaseURL: "https://two"}},
-		Models: []catalog.Model{
-			{ID: "model-one", Provider: "one", UpstreamModel: "one", Capabilities: []string{"chat"}},
-			{ID: "model-two", Provider: "two", UpstreamModel: "two", Capabilities: []string{"chat"}},
-		},
-	}
-	if err := c.Validate(); err != nil {
-		t.Fatal(err)
-	}
-	rule := catalog.RoutingRule{ID: "smart-chat", Enabled: true, Members: []catalog.RoutingRuleMember{
-		{ModelID: "model-two", Priority: 20, Weight: 100}, {ModelID: "model-one", Priority: 10, Weight: 100},
-	}}
-	routes, err := New(c, map[string]string{"one": "key", "two": "key"}, []catalog.RoutingRule{rule}).Resolve("smart-chat", "chat")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(routes) != 2 || routes[0].Model.ID != "model-one" || routes[1].Model.ID != "model-two" {
-		t.Fatalf("unexpected cross-model route order: %#v", routes)
-	}
-}
-
-func TestResolveCrossModelRoutingRuleByWeight(t *testing.T) {
-	c := &catalog.Catalog{
-		Providers: []catalog.Provider{{ID: "one", BaseURL: "https://one"}, {ID: "two", BaseURL: "https://two"}},
-		Models: []catalog.Model{
-			{ID: "model-one", Provider: "one", UpstreamModel: "one", Capabilities: []string{"chat"}},
-			{ID: "model-two", Provider: "two", UpstreamModel: "two", Capabilities: []string{"chat"}},
-		},
-	}
-	if err := c.Validate(); err != nil {
-		t.Fatal(err)
-	}
-	rule := catalog.RoutingRule{ID: "balanced", Enabled: true, Members: []catalog.RoutingRuleMember{
-		{ModelID: "model-one", Priority: 10, Weight: 3}, {ModelID: "model-two", Priority: 10, Weight: 1},
-	}}
-	r := New(c, map[string]string{"one": "key", "two": "key"}, []catalog.RoutingRule{rule})
-	selected := map[string]int{}
-	for range 4 {
-		routes, err := r.Resolve("balanced", "chat")
-		if err != nil {
-			t.Fatal(err)
-		}
-		selected[routes[0].Model.ID]++
-	}
-	if selected["model-one"] != 3 || selected["model-two"] != 1 {
-		t.Fatalf("unexpected cross-model distribution: %#v", selected)
 	}
 }
