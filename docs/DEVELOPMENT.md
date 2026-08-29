@@ -20,7 +20,7 @@ The script starts:
 - Hot module replacement for React and TypeScript changes.
 - Vite proxies for `/api`, `/v1`, `/healthz`, `/readyz`, and `/metrics` to Go.
 
-Port `5173` is only a frontend development server. Applications call the gateway on port `8080`; the console Overview page uses `OPENSWIFTSCALE_PUBLIC_URL` to show the LAN-reachable inference address.
+Port `5173` is only a frontend development server. Applications call the gateway on port `8080`; `OPENSWIFTSCALE_PUBLIC_URL` defines the LAN-reachable inference address.
 
 The default development administrator is `admin` / `openswiftscale`. Development data is persisted in `data/openswiftscale.db` and remains after a restart.
 
@@ -51,7 +51,7 @@ The frontend production build is written to `internal/webui/dist` and embedded i
 | --- | --- |
 | `cmd/openswiftscale` | Process entry point and healthcheck command. |
 | `internal/gateway` | HTTP routing, authentication orchestration, management API, and inference proxy. |
-| `internal/router` | Priority, weight, failover, and alias resolution. |
+| `internal/router` | Exact-model priority, weight, platform scoring, and failover resolution. |
 | `internal/provider` | Upstream HTTP and protocol adapters. |
 | `internal/store` | SQLite schema, configuration, API users, keys, and usage records. |
 | `internal/secret` | Master-key handling and provider-credential encryption. |
@@ -65,9 +65,8 @@ The frontend production build is written to `internal/webui/dist` and embedded i
 
 Use an official provider contract. Add seed metadata to `config/catalog.yaml`, keep the Public Model ID distinct from the upstream provider ID, specify only supported capabilities, and add catalog/router/provider tests. Prices are estimates and must be documented as such.
 
-Third-party and local OpenAI-compatible endpoints normally do not require source changes; add them through **Console → Connections**.
+Third-party and local OpenAI-compatible endpoints normally do not require source changes; add them from the **Models** workspace.
 
 ## Pull requests
 
 Keep changes focused, do not include generated databases or secrets, update English documentation for user-visible behavior, add translations for console strings, and include tests proportional to the request-path risk. See [Contributing](../CONTRIBUTING.md).
-

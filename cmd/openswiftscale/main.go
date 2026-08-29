@@ -89,25 +89,28 @@ func main() {
 		logger.Error("load runtime provider configuration", "error", err)
 		os.Exit(1)
 	}
-	routingRules, err := database.RoutingRules(context.Background())
-	if err != nil {
-		logger.Error("load routing rules", "error", err)
-		os.Exit(1)
-	}
-
 	httpClient := &http.Client{Timeout: cfg.RequestTimeout, Transport: &http.Transport{
 		Proxy: http.ProxyFromEnvironment, MaxIdleConns: 100, MaxIdleConnsPerHost: 20,
 		IdleConnTimeout: 90 * time.Second, ResponseHeaderTimeout: 60 * time.Second,
 	}}
 	gateway.Version = version
-	app := gateway.New(cfg, runtimeCatalog, auth.New(cfg.APIKeys, cfg.AuthDisabled), router.New(runtimeCatalog, keys, routingRules), provider.NewClient(httpClient), database, logger)
-	server := &http.Server{Addr: cfg.ListenAddr, Handler: app.Handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second}
+	app := gateway.New(cfg, runtimeCatalog, auth.New(cfg.APIKeys, cfg.AuthDisabled), router.New(runtimeCatalog, keys), provider.NewClient(httpClient), database, logger)
+	addresses := []string{cfg.ListenAddr}
+	if cfg.LANListenAddr != "" && cfg.LANListenAddr != cfg.ListenAddr {
+		addresses = append(addresses, cfg.LANListenAddr)
+	}
+	servers := make([]*http.Server, 0, len(addresses))
+	for _, address := range addresses {
+		servers = append(servers, &http.Server{Addr: address, Handler: app.Handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second})
+	}
 
-	errors := make(chan error, 1)
-	go func() {
-		logger.Info("OpenSwiftScale started", "version", version, "address", cfg.ListenAddr)
-		errors <- server.ListenAndServe()
-	}()
+	errors := make(chan error, len(servers))
+	for _, server := range servers {
+		go func(server *http.Server) {
+			logger.Info("OpenSwiftScale started", "version", version, "address", server.Addr)
+			errors <- server.ListenAndServe()
+		}(server)
+	}
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	select {
@@ -120,7 +123,9 @@ func main() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := server.Shutdown(ctx); err != nil {
-		logger.Error("graceful shutdown", "error", err)
+	for _, server := range servers {
+		if err := server.Shutdown(ctx); err != nil {
+			logger.Error("graceful shutdown", "address", server.Addr, "error", err)
+		}
 	}
 }

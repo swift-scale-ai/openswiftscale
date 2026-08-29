@@ -52,6 +52,25 @@ func TestRecentReturnsEmptyArrayWhenNoUsageExists(t *testing.T) {
 	}
 }
 
+func TestRecentPageAppliesOffset(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "paged-usage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	base := time.Now().UTC()
+	for index, id := range []string{"req-oldest", "req-middle", "req-newest"} {
+		if err := s.Record(ctx, Usage{RequestID: id, Model: "model", Provider: "provider", Status: 200, CreatedAt: base.Add(time.Duration(index) * time.Second)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recent, err := s.RecentPage(ctx, 1, 1)
+	if err != nil || len(recent) != 1 || recent[0].RequestID != "req-middle" {
+		t.Fatalf("unexpected paged usage: %#v, %v", recent, err)
+	}
+}
+
 func TestProviderConfigurationIsEncryptedAndReloaded(t *testing.T) {
 	directory := t.TempDir()
 	protector, err := secret.LoadOrCreate(filepath.Join(directory, "master.key"), "")
@@ -64,7 +83,7 @@ func TestProviderConfigurationIsEncryptedAndReloaded(t *testing.T) {
 	}
 	defer s.Close()
 	ctx := context.Background()
-	c := &catalog.Catalog{Providers: []catalog.Provider{{ID: "official", Type: "openai-compatible", BaseURL: "https://provider.example"}}, Models: []catalog.Model{{ID: "model", Name: "Model", Family: "test", Provider: "official", UpstreamModel: "upstream", Capabilities: []string{"chat"}}}}
+	c := &catalog.Catalog{Providers: []catalog.Provider{{ID: "official", Type: "openai-compatible", BaseURL: "https://provider.example"}}, Families: []catalog.ModelFamily{{ID: "image", Name: "Image", Publisher: "Example", Provider: "official", Capabilities: []string{"image"}}}, Models: []catalog.Model{{ID: "model", Name: "Model", Family: "test", Provider: "official", UpstreamModel: "upstream", Capabilities: []string{"chat"}}}}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +109,7 @@ func TestProviderConfigurationIsEncryptedAndReloaded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(runtimeCatalog.Models) != 1 || keys["official"] != key {
+	if len(runtimeCatalog.Models) != 1 || len(runtimeCatalog.Families) != 1 || runtimeCatalog.Families[0].ID != "image" || keys["official"] != key {
 		t.Fatalf("unexpected runtime configuration: %#v %#v", runtimeCatalog, keys)
 	}
 	providers, err := s.Providers(ctx)
@@ -162,6 +181,92 @@ func TestMultipleRoutesSharePublicModelAndSurviveConnectionDeletion(t *testing.T
 	}
 }
 
+func TestSimpleModelRouteSettingsRoundTrip(t *testing.T) {
+	directory := t.TempDir()
+	protector, err := secret.LoadOrCreate(filepath.Join(directory, "master.key"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := OpenWithProtector(filepath.Join(directory, "gateway.db"), protector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	for _, providerID := range []string{"route-one", "route-two"} {
+		key := providerID + "-secret"
+		p := catalog.Provider{ID: providerID, Type: "openai-compatible", BaseURL: "https://" + providerID + ".example"}
+		m := catalog.Model{ID: "shared-model", Name: "Shared model", Family: "test", Provider: providerID, UpstreamModel: providerID, Capabilities: []string{"chat"}, Pricing: catalog.Pricing{Currency: "USD"}}
+		if err := s.SaveConnection(ctx, ConnectionUpdate{Provider: p, Name: providerID, Enabled: true, APIKey: &key, Models: []catalog.Model{m}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	settings, found, err := s.ModelRouteSettings(ctx, "shared-model")
+	if err != nil || !found || !settings.UsePlatformDefault || len(settings.Endpoints) != 2 {
+		t.Fatalf("unexpected initial settings: %#v found=%v err=%v", settings, found, err)
+	}
+	settings.UsePlatformDefault = false
+	settings.PreferredRegion = "apac"
+	settings.Endpoints[0], settings.Endpoints[1] = settings.Endpoints[1], settings.Endpoints[0]
+	settings.Endpoints[0].Weight = 70
+	settings.Endpoints[1].Weight = 30
+	settings.Endpoints[1].Enabled = false
+	if err := s.SaveModelRouteSettings(ctx, settings); err != nil {
+		t.Fatal(err)
+	}
+	updated, found, err := s.ModelRouteSettings(ctx, "shared-model")
+	if err != nil || !found || updated.UsePlatformDefault || updated.RoutingMode != "failover" || updated.PreferredRegion != "apac" || updated.Endpoints[0].ProviderID != "route-two" || updated.Endpoints[0].Priority != 10 || updated.Endpoints[0].Weight != 100 || updated.Endpoints[1].Enabled {
+		t.Fatalf("manual settings were not persisted: %#v found=%v err=%v", updated, found, err)
+	}
+	runtimeCatalog, _, err := s.RuntimeCatalog(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes := runtimeCatalog.ModelsByID("shared-model")
+	if len(routes) != 1 || !routes[0].ManualRouting || routes[0].RoutingMode != "failover" || routes[0].RouteOrder != 10 || routes[0].Weight != 100 {
+		t.Fatalf("manual routing metadata was not loaded: %#v", routes)
+	}
+	updated.RoutingMode = "weighted"
+	updated.Endpoints[0].Weight = 70
+	updated.Endpoints[1].Weight = 30
+	updated.Endpoints[1].Enabled = true
+	if err := s.SaveModelRouteSettings(ctx, updated); err != nil {
+		t.Fatal(err)
+	}
+	weighted, _, err := s.ModelRouteSettings(ctx, "shared-model")
+	weightedByProvider := map[string]ModelRouteEndpoint{}
+	for _, endpoint := range weighted.Endpoints {
+		weightedByProvider[endpoint.ProviderID] = endpoint
+	}
+	if err != nil || weighted.RoutingMode != "weighted" || weighted.UsePlatformDefault || weightedByProvider["route-two"].Priority != 100 || weightedByProvider["route-two"].Weight != 70 || weightedByProvider["route-one"].Priority != 100 || weightedByProvider["route-one"].Weight != 30 {
+		t.Fatalf("weighted settings were not persisted: %#v err=%v", weighted, err)
+	}
+	runtimeCatalog, _, err = s.RuntimeCatalog(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes = runtimeCatalog.ModelsByID("shared-model")
+	if len(routes) != 2 || routes[0].RoutingMode != "weighted" || routes[1].RoutingMode != "weighted" {
+		t.Fatalf("weighted routing metadata was not loaded: %#v", routes)
+	}
+	updated = weighted
+	updated.UsePlatformDefault = true
+	updated.RoutingMode = "platform"
+	if err := s.RecordRouteOutcome(ctx, RouteOutcome{ModelID: "shared-model", ProviderID: "route-two", Success: true, Status: 200, LatencyMS: 125}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordRouteOutcome(ctx, RouteOutcome{ModelID: "shared-model", ProviderID: "route-one", Success: false, Status: 503, LatencyMS: 900, Error: "HTTP 503"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveModelRouteSettings(ctx, updated); err != nil {
+		t.Fatal(err)
+	}
+	defaults, _, err := s.ModelRouteSettings(ctx, "shared-model")
+	if err != nil || !defaults.UsePlatformDefault || defaults.PreferredRegion != "apac" || defaults.Endpoints[0].ProviderID != "route-two" || defaults.Endpoints[0].SuccessCount != 1 || defaults.Endpoints[0].Availability != 1 || defaults.Endpoints[0].PlatformScore <= defaults.Endpoints[1].PlatformScore {
+		t.Fatalf("platform defaults were not restored: %#v err=%v", defaults, err)
+	}
+}
+
 func TestMigrationBackfillsLegacyModelRoute(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.db")
 	db, err := sql.Open("sqlite", path)
@@ -205,98 +310,5 @@ VALUES ('legacy-model','Legacy model','test','legacy','legacy-upstream','["chat"
 	}
 	if priority != 100 || weight != 100 {
 		t.Fatalf("unexpected migrated route policy: priority=%d weight=%d", priority, weight)
-	}
-}
-
-func TestRoutingRuleRoundTrip(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "routing-rules.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	ctx := context.Background()
-	emptyRules, err := s.RoutingRules(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if emptyRules == nil || len(emptyRules) != 0 {
-		t.Fatalf("empty routing rules must be encoded as an empty array: %#v", emptyRules)
-	}
-	c := &catalog.Catalog{
-		Providers: []catalog.Provider{{ID: "provider", Type: "openai-compatible", BaseURL: "https://provider.example"}},
-		Models: []catalog.Model{
-			{ID: "model-a", Name: "Model A", Family: "test", Provider: "provider", UpstreamModel: "a", Capabilities: []string{"chat"}},
-			{ID: "model-b", Name: "Model B", Family: "test", Provider: "provider", UpstreamModel: "b", Capabilities: []string{"chat"}},
-		},
-	}
-	if err := c.Validate(); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.SeedCatalog(ctx, c); err != nil {
-		t.Fatal(err)
-	}
-	rule := catalog.RoutingRule{ID: "smart-chat", Name: "Smart chat", Enabled: true, Members: []catalog.RoutingRuleMember{
-		{ModelID: "model-a", Priority: 10, Weight: 70}, {ModelID: "model-b", Priority: 20, Weight: 30},
-	}}
-	if err := s.SaveRoutingRule(ctx, rule); err != nil {
-		t.Fatal(err)
-	}
-	rules, err := s.RoutingRules(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rules) != 1 || len(rules[0].Members) != 2 || rules[0].Members[0].ModelID != "model-a" {
-		t.Fatalf("unexpected rules: %#v", rules)
-	}
-	if err := s.DeleteRoutingRule(ctx, "smart-chat"); err != nil {
-		t.Fatal(err)
-	}
-	rules, err = s.RoutingRules(ctx)
-	if err != nil || len(rules) != 0 {
-		t.Fatalf("routing rule was not deleted: %#v %v", rules, err)
-	}
-}
-
-func TestModelRoutePolicyRoundTrip(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "model-route-policies.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	ctx := context.Background()
-	c := &catalog.Catalog{
-		Providers: []catalog.Provider{{ID: "provider", Type: "openai-compatible", BaseURL: "https://provider.example"}},
-		Models:    []catalog.Model{{ID: "model-a", Name: "Model A", Family: "test", Provider: "provider", UpstreamModel: "a", Capabilities: []string{"chat"}}},
-	}
-	if err := c.Validate(); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.SeedCatalog(ctx, c); err != nil {
-		t.Fatal(err)
-	}
-	policies, err := s.ModelRoutePolicies(ctx)
-	if err != nil || policies == nil || len(policies) != 0 {
-		t.Fatalf("expected an empty policy list: %#v %v", policies, err)
-	}
-	if err := s.SaveModelRoutePolicy(ctx, ModelRoutePolicy{ModelID: "model-a", Strategy: "failover"}); err != nil {
-		t.Fatal(err)
-	}
-	policies, err = s.ModelRoutePolicies(ctx)
-	if err != nil || len(policies) != 1 || policies[0].ModelID != "model-a" || policies[0].Strategy != "failover" {
-		t.Fatalf("unexpected policies: %#v %v", policies, err)
-	}
-	if err := s.SaveModelRoutePolicy(ctx, ModelRoutePolicy{ModelID: "model-a", Strategy: "hybrid"}); err != nil {
-		t.Fatal(err)
-	}
-	policies, err = s.ModelRoutePolicies(ctx)
-	if err != nil || len(policies) != 1 || policies[0].Strategy != "hybrid" {
-		t.Fatalf("policy update failed: %#v %v", policies, err)
-	}
-	if err := s.DeleteModelRoutePolicy(ctx, "model-a"); err != nil {
-		t.Fatal(err)
-	}
-	policies, err = s.ModelRoutePolicies(ctx)
-	if err != nil || len(policies) != 0 {
-		t.Fatalf("policy was not deleted: %#v %v", policies, err)
 	}
 }

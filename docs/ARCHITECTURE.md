@@ -29,7 +29,6 @@ The default deployment is one Go process. It contains:
 - API-user registry with independently revocable, hash-only Gateway API keys.
 - SQLite-backed provider and model registry, initially seeded from YAML.
 - Multi-route model router with priorities, weighted selection, and configured fallback chains.
-- Advanced virtual model aliases with public Alias IDs and ordered/weighted model members.
 - OpenAI-compatible proxy adapter.
 - Anthropic Messages request/response translation.
 - SQLite usage store in WAL mode.
@@ -46,24 +45,23 @@ During local development, `scripts/dev.sh` runs the Go gateway on port 8080 and 
 2. Authenticate either a bootstrap Gateway API key or a managed API-user key. Managed keys are matched by SHA-256 hash and disabled users are rejected.
 3. Enforce the configured request body limit.
 4. Parse the requested public model ID.
-5. Resolve the requested ID as either a Public Model ID or a cross-model Route ID and validate endpoint capability.
-6. For an advanced Alias ID, order member models by priority and select among equal-priority models by relative weight.
-7. For each selected model, order provider endpoints by route priority and select among equal-priority endpoints by relative weight.
-8. On connection errors, timeouts, rejected credentials, throttling, or upstream server errors, advance through endpoints and then member models.
-9. Rewrite the public model ID to the selected provider model ID.
-10. Replace the client Authorization header with the provider credential.
-11. Forward the request or translate it to Anthropic Messages.
-12. Stream provider bytes/events without buffering the complete response.
-13. Extract usage when the provider supplies it.
-14. Persist request metadata, tokens, cost estimate, status, latency, and the provider that served the request to SQLite.
+5. Resolve the requested exact model ID and validate endpoint capability.
+6. Apply its explicit routing mode: platform scoring, strict sequential failover, or weighted distribution across participating endpoints.
+7. On connection errors, timeouts, rejected credentials, throttling, or upstream server errors, advance only through endpoints serving that same exact model ID.
+8. Rewrite the public model ID to the selected provider model ID.
+9. Replace the client Authorization header with the provider credential.
+10. Forward the request or translate it to Anthropic Messages.
+11. Stream provider bytes/events without buffering the complete response.
+12. Extract usage when the provider supplies it.
+13. Persist request metadata, tokens, cost estimate, status, latency, and the provider that served the request to SQLite.
 
 Prompt and response bodies are not persisted.
 
-## Open-core boundary
+## Product boundary
 
-The public Go module is the source of truth for the request path, provider contracts, local storage, and Community console. Commercial SwiftScale products should import this kernel and add private implementations around its interfaces rather than maintain a fork.
+OpenSwiftScale is technically independent from SwiftScale. It does not share backend services, databases, accounts, configuration, queues, internal packages, or runtime state with SwiftScale products.
 
-Enterprise extensions may provide centralized identity, SSO/SCIM, fleet configuration, audit export, policy approval, high-availability coordination, and commercial support. SwiftScale Cloud may provide managed inference, global routing, billing, and proprietary routing intelligence.
+OpenSwiftScale Cloud and the self-hosted edition share public contracts and product conventions rather than a required live backend dependency: brand, user experience, model hierarchy, exact-model routing invariant, and OpenAI-compatible API behavior. Cloud-only account, balance, payment, and managed-endpoint services stay outside the self-hosted process.
 
 ## Persistence
 
@@ -71,22 +69,20 @@ SQLite is the default because it keeps single-node deployment small and operatio
 
 `api_users` owns application, person, team, or environment identities. `api_keys` stores key labels, safe prefixes, SHA-256 hashes, enabled state, creation time, and last-used time. Plaintext managed keys are returned once at creation and cannot be recovered from the database. Disabling a user invalidates all owned keys; deleting a user cascades to those keys.
 
-Public model metadata and provider routes are stored separately. `model_configs` owns the stable public model identity; `model_routes` maps it to one or more provider connections and stores the upstream model ID, capability set, priority, weight, limits, and local price estimate. The `(public model ID, provider connection ID)` pair is unique, while a public model ID can appear in any number of routes.
+Public model metadata and provider routes are stored separately. `model_configs` owns the stable public model identity; `model_routes` maps it to one or more provider connections and stores the upstream model ID, capability set, priority, weight, limits, local price estimate, success/failure counters, latency EWMA, and most recent health result. The `(public model ID, provider connection ID)` pair is unique, while a public model ID can appear in any number of routes.
 
-`model_route_policies` records which model route groups an administrator explicitly created through the console and stores the selected failover, load-balancing, or hybrid strategy. Seeded catalog models are not automatically promoted to route rules.
+`model_route_preferences` stores the per-model routing mode (`platform`, `failover`, or `weighted`) plus the optional regional preference. Participation, priority, and weight remain properties of each `model_routes` row. Failover mode persists distinct priorities and neutral weights; weighted mode persists one priority group and relative weights. Disabling a route does not delete its connection or prevent it from being enabled again.
 
-`routing_rules` owns public Route IDs and `routing_rule_members` maps each rule to different Public Model IDs with a priority and weight. Rules cannot recursively contain other rules in the Community implementation, which keeps resolution bounded and inspectable.
+The official YAML catalog is seed data rather than the runtime source of truth. On first start, official provider templates and models are inserted into SQLite. Saving a connection through the management API refreshes the in-memory routing snapshot atomically, so inference does not require a restart. Startup and readiness never depend on upstream API-key validation. Administrators can explicitly run a read-only `/v1/models` probe; real inference attempts also update route health observations and refresh the default score.
 
-The official YAML catalog is seed data rather than the runtime source of truth. On first start, official provider templates and models are inserted into SQLite. Saving a connection through the management API refreshes the in-memory routing snapshot atomically, so inference does not require a restart. Startup and readiness never depend on upstream API-key validation.
-
-Future team and HA profiles may add PostgreSQL. Redis must remain optional and should only be introduced for cross-instance coordination that cannot be handled by PostgreSQL.
+The default runtime remains intentionally single-node. PostgreSQL, Redis, and distributed coordination are not part of the self-hosted product unless a concrete developer use case justifies their operational cost.
 
 ## Extension boundaries
 
 The initial implementation separates:
 
 - `catalog`: provider and model contracts.
-- `router`: capability filtering, priority ordering, weighted selection, and failover resolution.
+- `router`: exact-model capability filtering, priority ordering, weighted selection, and failover resolution.
 - `provider`: HTTP and protocol translation.
 - `auth`: bootstrap API-key and administrator-request parsing.
 - `store`: provider/model configuration, managed API users and keys, routing policy, and operational usage records.
@@ -94,4 +90,4 @@ The initial implementation separates:
 - `gateway`: HTTP orchestration.
 - `webui`: embedded management console.
 
-Go's runtime plugin mechanism is intentionally avoided because it complicates portability and supply-chain review. Enterprise builds should use compile-time composition or a separately authenticated control-plane service.
+Go's runtime plugin mechanism is intentionally avoided because it complicates portability and supply-chain review.

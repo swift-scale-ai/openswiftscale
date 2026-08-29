@@ -31,6 +31,29 @@ func TestLoadPublicURL(t *testing.T) {
 	}
 }
 
+func TestLoadSpecificLANListenAddress(t *testing.T) {
+	t.Setenv("OPENSWIFTSCALE_API_KEYS", "client-key")
+	t.Setenv("OPENSWIFTSCALE_ADMIN_PASSWORD", "console-password")
+	t.Setenv("OPENSWIFTSCALE_LAN_LISTEN_ADDR", "192.168.1.25:8080")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LANListenAddr != "192.168.1.25:8080" {
+		t.Fatalf("unexpected LAN listen address: %q", cfg.LANListenAddr)
+	}
+}
+
+func TestRejectsUnspecifiedLANListenAddress(t *testing.T) {
+	t.Setenv("OPENSWIFTSCALE_API_KEYS", "client-key")
+	t.Setenv("OPENSWIFTSCALE_ADMIN_PASSWORD", "console-password")
+	t.Setenv("OPENSWIFTSCALE_LAN_LISTEN_ADDR", "0.0.0.0:8080")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected unspecified LAN listen address to be rejected")
+	}
+}
+
 func TestLoadMigratesManagementTokenToAdminPassword(t *testing.T) {
 	t.Setenv("OPENSWIFTSCALE_API_KEYS", "client-key")
 	t.Setenv("OPENSWIFTSCALE_ADMIN_USERNAME", "")

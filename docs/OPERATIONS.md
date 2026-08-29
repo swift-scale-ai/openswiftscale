@@ -21,11 +21,11 @@ Users do not need to invoke `docker compose` directly.
 
 ## First configuration
 
-1. Sign in with the administrator account printed by the installer.
-2. Open **Connections** and configure at least one official or third-party provider API key.
-3. Open **Route rules** and create the desired model-ID endpoint policy.
+1. Sign in with the administrator account printed by the installer. For local source development, the default login is username `admin` and password `openswiftscale`.
+2. Open **Models**, select an exact model ID, and configure at least one official or third-party endpoint with its provider API key.
+3. If the model has multiple endpoints, open **Route settings** and choose platform default, sequential failover, or weighted distribution.
 4. Open **API access**, create an API user, and issue a Gateway API key.
-5. Copy the API base URL and a callable model ID from **Overview**.
+5. Select local or LAN access, then copy the API base URL and a callable model ID.
 6. Test with one of the built-in cURL, Python, Go, Node.js, Java, or Rust examples.
 
 ## Networking
@@ -45,8 +45,7 @@ Terminate TLS at a trusted reverse proxy or ingress before allowing traffic acro
 - `GET /healthz`: process health.
 - `GET /readyz`: database readiness.
 - `GET /metrics`: Prometheus-format operational metrics.
-- **Overview**: request, latency, provider, token, and estimated-cost visualizations.
-- **Usage**: recent request metadata without prompt bodies.
+- **Runtime monitoring**: compact process health plus paginated recent request metadata without prompt bodies.
 
 Estimated cost is derived from locally configured model prices and reported token counts. It is not a provider invoice.
 
@@ -68,4 +67,3 @@ Pin a version or image digest in production rather than relying on `latest`. Sch
 - If port `8080` is already serving OpenSwiftScale, stop that instance rather than starting a second gateway on a different port unintentionally.
 
 See [Data and storage](DATA_AND_STORAGE.md) and [Security](../SECURITY.md) for backups and production hardening.
-

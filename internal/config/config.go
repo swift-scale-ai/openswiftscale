@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 
 type Config struct {
 	ListenAddr     string
+	LANListenAddr  string
 	PublicURL      string
 	AdminUsername  string
 	AdminPassword  string
@@ -36,6 +38,7 @@ func Load() (Config, error) {
 	apiKeys := splitCSV(secretOrEnv("OPENSWIFTSCALE_API_KEYS"))
 	cfg := Config{
 		ListenAddr:     env("OPENSWIFTSCALE_LISTEN_ADDR", ":8080"),
+		LANListenAddr:  strings.TrimSpace(os.Getenv("OPENSWIFTSCALE_LAN_LISTEN_ADDR")),
 		PublicURL:      strings.TrimRight(env("OPENSWIFTSCALE_PUBLIC_URL", ""), "/"),
 		AdminUsername:  env("OPENSWIFTSCALE_ADMIN_USERNAME", "admin"),
 		AdminPassword:  adminPassword,
@@ -53,6 +56,13 @@ func Load() (Config, error) {
 		parsed, parseErr := url.Parse(cfg.PublicURL)
 		if parseErr != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.RawQuery != "" || parsed.Fragment != "" {
 			return Config{}, fmt.Errorf("OPENSWIFTSCALE_PUBLIC_URL must be an http or https origin")
+		}
+	}
+	if cfg.LANListenAddr != "" {
+		host, port, splitErr := net.SplitHostPort(cfg.LANListenAddr)
+		ip := net.ParseIP(strings.Trim(host, "[]"))
+		if splitErr != nil || port == "" || ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
+			return Config{}, fmt.Errorf("OPENSWIFTSCALE_LAN_LISTEN_ADDR must use one specific non-loopback IP and port")
 		}
 	}
 	var err error

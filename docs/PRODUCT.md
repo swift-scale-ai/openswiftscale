@@ -2,55 +2,71 @@
 
 ## Product statement
 
-OpenSwiftScale is a free, open-source, self-hosted AI gateway for developers and organizations that want a simple OpenAI-compatible endpoint while retaining control over model credentials, network paths, request data, and operational records.
+OpenSwiftScale is a free, open-source, self-hosted AI gateway for individual developers and small teams. It provides one OpenAI-compatible endpoint while making the complete request path understandable: model publisher, model family, exact model ID, and every endpoint capable of serving it.
 
-The Community product must remain useful without an account, license server, hosted control plane, or mandatory telemetry. Its adoption builds the SwiftScale brand and creates a natural path to enterprise governance and managed SwiftScale services.
+OpenSwiftScale is an independent product and brand. It does not require a hosted account, license server, external control plane, or mandatory telemetry.
+
+## Product forms
+
+OpenSwiftScale has two product forms:
+
+- **Open-source self-hosted:** a compact gateway operated by the developer on infrastructure they control.
+- **OpenSwiftScale Cloud:** a managed service with hosted accounts, billing, and platform-operated endpoints.
+
+There is no OpenSwiftScale Enterprise or Dedicated edition. Organization governance and private deployment platform features belong outside the OpenSwiftScale product line so the open-source and Cloud experiences can remain small, consistent, and developer-focused.
 
 ## Design principles
 
-1. **Useful in three minutes.** A developer should move from clone to first request with Docker Compose and one provider key.
-2. **Local control is real.** Inference data and credentials stay inside the user-selected network path.
-3. **No forced cloud dependency.** SwiftScale Cloud integrations are optional and opt-in.
-4. **Small default footprint.** One process, one container, embedded UI, SQLite.
-5. **Protocols before proprietary SDKs.** OpenAI-compatible HTTP is the primary client contract.
-6. **Transparent routing.** Every public model maps to inspectable provider routes with explicit priorities, weights, and failover behavior.
-7. **Secure defaults.** Separate data-plane and management credentials, no prompt logging, no telemetry, non-root container.
-8. **Community is not a trial.** Core routing, observability, and direct provider access remain free.
+1. **Useful in three minutes.** Install, add one provider key, create one Gateway API key, test, and finish.
+2. **One transparent workspace.** The primary interface follows publisher → family → exact model ID → endpoints.
+3. **The requested model is immutable.** Routing may select another endpoint for the same exact model, but must never silently substitute a different model.
+4. **Simple defaults, visible control.** OpenSwiftScale chooses a sensible endpoint order; users may override that order without learning a routing language.
+5. **Local control is real.** Credentials, request metadata, and operational records stay inside the user-selected network path.
+6. **Small default footprint.** One process, one container, embedded UI, and SQLite.
+7. **Protocols before proprietary SDKs.** OpenAI-compatible HTTP is the primary client contract.
+8. **Secure defaults.** Separate data-plane and management credentials, no prompt logging, no telemetry, and a non-root container.
 
 ## Target users
 
-- Individual developers using several commercial or local model providers.
-- Startup teams that need one internal AI endpoint and local cost visibility.
-- Enterprise platform teams evaluating a controlled internal AI gateway.
-- Regulated teams that cannot send gateway telemetry to an external SaaS.
+- Individual developers using several commercial, open-weight, or local model providers.
+- Small product teams that need one inexpensive internal AI endpoint.
+- Developers who want to understand exactly which provider endpoint served a request.
 
-## Community scope
+Organization hierarchies, SSO/SCIM, approval workflows, compliance suites, and fleet management are intentionally outside this product.
+
+## Open-source scope
 
 - Direct provider connections and BYOK.
-- OpenAI-compatible chat, responses, embeddings, and model discovery.
-- Streaming, tool calls, structured output pass-through, and provider error handling.
-- Versioned model catalog, multi-route priorities, weighted traffic, and explicit fallbacks.
-- A guided model-route wizard for failover, load-balancing, and hybrid endpoint pools.
-- Managed API users, independently revocable hash-only Gateway API keys, and separate administrator authentication.
-- Local request metadata, token usage, estimated cost, and latency.
+- A model catalog organized by publisher, family, exact model ID, and endpoint.
+- Same-model endpoint ordering and failover with no cross-model substitution.
+- Unified chat, responses, embeddings, image generation, reranking, video generation, speech synthesis, transcription, and model discovery APIs.
+- Streaming, tool calls, structured-output pass-through, and provider error handling.
+- Independently revocable, hash-only Gateway API keys and separate administrator authentication.
+- Local request metadata, Token usage, estimated cost, latency, and serving endpoint.
 - Embedded web console, health, readiness, and Prometheus metrics.
 - Docker Compose and multi-architecture release artifacts.
-- Multilingual developer onboarding with callable model IDs and cURL, Python, Go, Node.js, Java, and Rust examples.
+- Multilingual onboarding and concise SDK examples.
 
-## Explicit non-goals for the first release
+## Explicit non-goals
 
-- Acting as a model reseller or credit wallet.
+- Semantic task classification or automatic model selection.
+- Virtual model aliases that route across different model IDs.
+- Organization-wide identity, policy, compliance, or multi-organization administration.
+- Acting as a model reseller or credit wallet in the self-hosted edition.
 - Depending on OpenRouter or another model aggregator.
-- Global traffic management or multi-region settlement.
 - Storing prompts or responses by default.
-- Reproducing SwiftScale's private smart-routing and commercial billing systems.
-- Semantic task classification and organization-wide request-policy routing; these belong to Enterprise and SwiftScale Cloud.
-- Claiming support for a model without an official direct API contract.
+- Claiming support for a model without a verifiable provider contract.
+
+## Open-source and Cloud consistency
+
+The self-hosted and Cloud editions use the same OpenSwiftScale brand, model hierarchy, exact-model routing invariant, API contract, and visual language. Cloud is a managed superset that adds hosted accounts, balance and payments, platform-operated endpoints, regional availability, observed quality metrics, and a clearly disclosed service fee. Cloud-only concerns do not add control-plane dependencies to the open-source runtime.
 
 ## Success criteria
 
 - First request in under three minutes after Docker is available.
+- A new user can understand the main screen without reading routing documentation.
+- Every request record identifies the requested model and serving endpoint.
+- The gateway never changes the exact requested model ID during failover.
 - Idle memory target below 100 MB for the default process.
 - Gateway processing overhead target below 5 ms p95, excluding provider time.
 - No outbound network calls except providers explicitly configured by the operator.
-- Community users can build, audit, run, and upgrade without contacting SwiftScale.
