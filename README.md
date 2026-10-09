@@ -16,6 +16,8 @@ A transparent, open-source, self-hosted AI gateway for developers.
 
 OpenSwiftScale gives developers and teams one OpenAI-compatible endpoint for directly connected model providers. It runs without a SwiftScale account, keeps provider keys inside your network, stores operational data locally, and sends no telemetry by default.
 
+![OpenSwiftScale console showing model publishers, model families, endpoint configuration, and transparent same-model routing](docs/models-and-endpoints.png)
+
 ## Documentation
 
 | Guide | Purpose |
